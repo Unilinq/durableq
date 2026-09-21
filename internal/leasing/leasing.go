@@ -100,15 +100,23 @@ func (h *Heartbeater) beat(ctx context.Context) {
 		h.TestSignals.Beat.Emit(0)
 		return
 	}
-	renewed := 0
+	renewed, lost := 0, 0
 	for _, r := range res {
 		if r.Err == nil {
 			renewed++
 			continue
 		}
-		// Losing a lease means something already reclaimed the item. The
-		// handler will find out when its own transition is rejected.
-		h.cfg.Logger.Warn("durableq: lease lost", "worker", h.cfg.Worker, "item", r.ID, "reason", r.Err)
+		lost++
+	}
+	if lost > 0 {
+		// The id list is a snapshot, so items that finished between taking it
+		// and this call are reported as lost. That is ordinary and happens
+		// once per item under load, which is why it is a debug line and a
+		// count rather than a warning per item. A lease genuinely stolen by
+		// the reclaimer is discovered where it matters: the handler's own
+		// transition is rejected.
+		h.cfg.Logger.Debug("durableq: leases not renewed",
+			"worker", h.cfg.Worker, "count", lost, "renewed", renewed)
 	}
 	if renewed > 0 {
 		h.cfg.Metrics.LeasesRenewed(h.cfg.Worker, renewed)

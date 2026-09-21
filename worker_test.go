@@ -687,3 +687,33 @@ func TestShutdownIsNotMistakenForAStuckHandler(t *testing.T) {
 		t.Fatalf("shutdown consumed an attempt: attempt %d, want 0", got.Attempt)
 	}
 }
+
+// newRealClockApp builds an app on the wall clock. Almost every test drives a
+// stub clock instead, which is what makes them deterministic; the load and soak
+// tests cannot, because a frozen clock means a retry scheduled ten milliseconds
+// out never becomes available and the run simply stalls.
+func newRealClockApp(t *testing.T, mutate ...func(*Config)) *testApp {
+	t.Helper()
+	store := dqtest.NewStore(t, storage.RealClock())
+
+	cfg := Config{
+		Store:           store,
+		WorkerID:        "test-worker",
+		PollInterval:    5 * time.Millisecond,
+		PollJitter:      0.2,
+		LeaseDuration:   30 * time.Second,
+		HandlerTimeout:  30 * time.Second,
+		DrainTimeout:    5 * time.Second,
+		ReclaimInterval: time.Second,
+		Clock:           storage.RealClock(),
+		Logger:          testLogger(t),
+	}
+	for _, m := range mutate {
+		m(&cfg)
+	}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return &testApp{App: app, store: store, clock: dqtest.NewStubClockNow()}
+}

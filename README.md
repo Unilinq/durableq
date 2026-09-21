@@ -275,6 +275,41 @@ storagetest.Run(t, storagetest.Harness{
 })
 ```
 
+## Observability
+
+DurableQ does not depend on a metrics library. Implement `durableq.Observer` and
+hand it to `Config`; an adapter over whatever your application already runs is a
+few lines.
+
+```go
+app, _ := durableq.New(durableq.Config{
+    Store:         store,
+    Observer:      myMetrics{},   // ItemsClaimed, ItemFinished, LeasesExpired, ...
+    DepthInterval: 15 * time.Second, // queue depth is the one polled gauge; off by default
+})
+```
+
+The interface carries `queue`, `step` and `worker` and never an execution or
+item id. High-cardinality identifiers belong in logs and traces, and making that
+structural means nobody has to remember it. An idle poll emits nothing, so a
+worker with no work does not look busy on a dashboard.
+
+## Performance
+
+On a laptop (Colima, PostgreSQL 16 in Docker, 6 vCPU), 100,000 items through the
+four-step pipeline — 200,101 item transitions — took 2m42s at roughly 1,230
+item-steps/sec, with heap in use going from 3.4 MiB to 18.2 MiB and no growth in
+goroutines. At 20,000 items the same pipeline runs at about 3,700
+item-steps/sec, so throughput falls as the tables grow; if that matters for your
+volumes, retention and per-queue partitioning are the levers to look at first.
+
+Run it yourself:
+
+```bash
+DURABLEQ_LOAD=1 DURABLEQ_LOAD_ITEMS=100000 go test . -run TestLoad -timeout 30m -v
+DURABLEQ_SOAK=1 DURABLEQ_SOAK_MINUTES=30 go test . -run TestSoak -timeout 45m -v
+```
+
 ## Running durableq's own tests
 
 They need a PostgreSQL to work against:
