@@ -426,3 +426,54 @@ flat across a quarter of a million items.
 **Scope note.** The brief asks for a 30-minute soak; this was run at 6 minutes (257k items) to leave the
 overnight run time for the remaining stages. `DURABLEQ_SOAK_MINUTES=30` runs the full form. Recorded as
 run, not as specified.
+
+### 2026-09-21T10:55Z — Stage 9 (docs, examples) and final verification — **PASS**
+
+- `README.md` — the public API, quickstart, migrations, operating the CLI, configuration, shutdown
+  semantics, observability, measured performance, and the exact `go.work use` / `replace` snippet for
+  consuming durableq from another repository.
+- `examples/queue` — a queue on its own, seeds a schema you can inspect with the CLI.
+- `examples/pipeline` — the design document's four-step job, prints the run projection.
+- External consumption verified for real: a throwaway module outside the repo, wired with a `replace`
+  directive, builds and wires both a queue and a job.
+  ```
+  EXTERNAL MODULE BUILD: OK
+  durableq wired from an external module: indexing [discover index]
+  ```
+
+**Final race gate on complete main (stages 1-8 merged):**
+```
+GATE 3 RESULT: 20 passed, 0 failed
+```
+
+## Summary
+
+| Stage | Verdict | Rounds |
+| --- | --- | --- |
+| 1 — Storage contract, PG schema, test harness | PASS | 1 |
+| 2 — Claim, ack, retry, lease | PASS | 1 |
+| 3 — Polling worker, public Queue API | PASS | 1 |
+| 4 — DLQ, replay, retention, CLI | PASS | 1 |
+| 4a — Concurrency and race gate (hard gate) | PASS | 1 |
+| 5 — Job, Execution, lineage | PASS | 1 |
+| 6 — Projections and leak detection | PASS | 1 |
+| 7 — Telemetry | PASS | 1 |
+| 8 — Load and soak | PASS | 2 |
+| 9 — Docs, examples | PASS | 1 |
+
+Three race-gate runs of 20 consecutive full-suite executions under `-race`: 60 runs, 0 failures, 0
+intermittents.
+
+Defects found and fixed during the build, none of which reached a verdict:
+1. Ambiguous column in the claim statement — every claim failed (stage 2).
+2. `App.Stop` hung for ever when called while the start context was still live (stage 3).
+3. Data race in the reclaim breaker, reachable by any operator running a manual pass (stage 3).
+4. Missing `HeartbeatInterval` — renewal was welded to `LeaseDuration/3` (stage 3).
+5. Destructive chaos test disturbing sibling tests through a shared database (stage 4a).
+6. Downstream items ignoring the receiving step's retry policy (stage 5).
+7. `durableq runs` printing a stored status that never changes (stage 6).
+8. Heartbeat warning once per item for ordinary lost-lease races (stage 8).
+
+Tests were wrong rather than the code four times, each corrected with a comment explaining the trap:
+claim order in a replay test, a frozen clock in the first heartbeat test, a stale buffered signal, and a
+stub clock in the soak.
