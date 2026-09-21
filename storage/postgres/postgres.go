@@ -129,6 +129,16 @@ const itemColumns = `id, queue, payload, state, outcome, attempt, max_attempts,
 	execution_id, step_id, item_id, parent_item_id,
 	produced, dropped, produced_capped, policy, created_at, updated_at, finalized_at`
 
+// qualifiedItemColumns renders the canonical select list prefixed with a table
+// alias, for statements where a bare column name would be ambiguous.
+func qualifiedItemColumns(alias string) string {
+	parts := strings.Split(itemColumns, ",")
+	for i, p := range parts {
+		parts[i] = alias + "." + strings.TrimSpace(p)
+	}
+	return strings.Join(parts, ", ")
+}
+
 type policyJSON struct {
 	MaxAttempts int     `json:"max_attempts"`
 	ScheduleNS  []int64 `json:"schedule_ns"`

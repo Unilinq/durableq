@@ -51,3 +51,51 @@ Negative controls (proving the rules fire, not just pass):
    but stage 4 criterion 1 requires a dead-lettered item to name its worker.
 4. **`outcome`, `produced`, `dropped`, `produced_capped` columns added now** so stages 5-6 need no second
    migration.
+
+### 2026-09-21T08:26Z — Stage 2 (claim, ack, retry, lease) — round 1 — **PASS**
+
+Branch `stage-2-claim-ack-retry`. 73 conformance subtests green.
+
+| Criterion | Evidence | Verdict |
+| --- | --- | --- |
+| 1. Claim honours limit | `Claim/HonoursLimit` (3, then the remaining 7, then 0) | PASS |
+| 2. Constrained to queue | `Claim/ConstrainedToQueue` | PASS |
+| 3. Skips future `available_at`, honours injected now | `Claim/SkipsItemsNotYetAvailable`, `Claim/HonoursAnInjectedNow` | PASS |
+| 4. Deterministic order | `Claim/OrderIsDeterministic` (inserted newest-first), `Claim/TiesBreakByID` | PASS |
+| 5. Over-long `leased_by` truncated, not an error | `Claim/OverLongWorkerIdentityIsTruncatedNotRejected` | PASS |
+| 6. Typed errors per mutator | `NotFound/*` and `WrongState/*` — 5 mutators x 2 = 10 subtests | PASS |
+| 7. Complete only affects running | `Transitions/CompleteDoesNotTouchAReadyItem`, `CompleteByTheWrongWorkerIsRejected` | PASS |
+| 8. Retry backoff exact | `Transitions/RetryReschedulesByPolicy` asserts 5s/30s/2m/10m exactly (jitter 0); `RetryJitterStaysInBounds` x20 | PASS |
+| 9. Lease expiry attempt accounting | `Lease/ExpiredLeaseIsReclaimedWithAttemptIntact` — attempt stays 1, next claim is 2 | PASS |
+| 10. Batch mixed outcomes | `Batch/MixedOutcomesReportedPerItem` (ok / not-found / wrong-state / ok in one call) | PASS |
+| 11. DeadLetter preserves metadata | `Transitions/DeadLetterPreservesMetadata` — error, attempts, worker, lineage, DLQ visible in Stats | PASS |
+| 12. 8 claimers x 1000 items, zero duplicates, `-count=10` | `Contention/NoDoubleDelivery` + `SingleItemRace` (16 racers, 1 winner) | PASS |
+| 13. No deadlocks | `Contention/NoDeadlocksUnderMixedLoad`; server log `deadlock detected|40P01` count = **0** | PASS |
+| 14. `-race -count=1` clean, claim suite at `-count=10` | see below | PASS |
+
+```
+go test ./storage/... -race -count=10 -run 'TestConformance/(Claim|Lease|Transitions)'  -> ok 5.554s
+go test ./storage/... -race -count=10 -run 'TestConformance/Contention'                 -> ok 6.178s
+go test ./... -race -count=1
+  ok  internal/arch 1.470s   ok internal/dqsignal 1.447s   ok storage/postgres 2.972s
+docker logs durableq-test-pg | grep -ciE "deadlock detected|40P01"  -> 0
+```
+
+Defect found and fixed during the stage (no fix round needed; caught by the suite before any verdict):
+`Claim`'s `UPDATE ... FROM candidate ... RETURNING <cols>` left the column list unqualified, so `id` was
+ambiguous (SQLSTATE 42702) and every claim failed. Fixed by `qualifiedItemColumns(alias)`.
+
+**Note on evidence commands.** The brief's `docker logs ... | grep -ci deadlock` is a false-positive trap:
+it matches the *schema name* of the `NoDeadlocksUnderMixedLoad` test, which appears in logged statement
+text. The real check is `grep -ciE "deadlock detected|40P01"`. Stage 4a uses the precise form.
+
+**Design notes.**
+- `leased_by` is `text`, which PostgreSQL does not bound, so the truncation criterion is enforced in code
+  at `Config.LeasedByMax` (default 128) rather than by the column. The test asserts the stored value is
+  shorter than what was passed and non-empty.
+- Ownership guard: every transition carries the worker identity and matches on `leased_by`. This is the
+  mechanism by which a worker whose lease already lapsed loses to the reclaimer
+  (`Lease/AckAfterLeaseExpiredLosesToTheReclaimer`). An empty worker means "no ownership check" and is
+  reserved for administrative paths such as the CLI.
+- `Release` deletes the open attempt row rather than closing it: a shutdown hand-back did not consume an
+  attempt, so it should leave no trace in the attempt history either.

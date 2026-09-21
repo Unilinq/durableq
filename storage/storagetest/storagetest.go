@@ -38,4 +38,11 @@ func Run(t *testing.T, h Harness) {
 	t.Run("Stats", func(t *testing.T) { runStats(t, h) })
 	t.Run("PauseResume", func(t *testing.T) { runPauseResume(t, h) })
 	t.Run("Isolation", func(t *testing.T) { runIsolation(t, h) })
+	t.Run("Claim", func(t *testing.T) { runClaim(t, h) })
+	t.Run("Transitions", func(t *testing.T) { runTransitions(t, h) })
+	t.Run("NotFound", func(t *testing.T) { runNotFound(t, h) })
+	t.Run("WrongState", func(t *testing.T) { runWrongState(t, h) })
+	t.Run("Batch", func(t *testing.T) { runBatch(t, h) })
+	t.Run("Lease", func(t *testing.T) { runLease(t, h) })
+	t.Run("Contention", func(t *testing.T) { runContention(t, h) })
 }

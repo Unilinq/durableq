@@ -205,6 +205,10 @@ type CompleteRequest struct {
 	ID       int64
 	Worker   string
 	Produced []NewItem
+	// Filtered marks a step that deliberately produced nothing, so a
+	// legitimate filter is distinguishable from a step that produced output.
+	// A plain queue handler leaves this false.
+	Filtered bool
 	// Dropped and Capped record output the step deliberately discarded, so a
 	// bounded discovery step does not look like a silent leak.
 	Dropped int
