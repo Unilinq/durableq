@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/unilinq/durableq/internal/dqsignal"
+	"github.com/unilinq/durableq/internal/telemetry"
 	"github.com/unilinq/durableq/storage"
 )
 
@@ -18,6 +19,8 @@ type ReclaimerConfig struct {
 	BatchSize int
 	Clock     storage.Clock
 	Logger    *slog.Logger
+	// Metrics receives runtime events. Nil means discard them.
+	Metrics telemetry.Sink
 }
 
 // Reclaimer returns items whose lease lapsed to their queue, or to the DLQ if
@@ -52,6 +55,9 @@ func NewReclaimer(cfg ReclaimerConfig) *Reclaimer {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = telemetry.Nop{}
 	}
 	return &Reclaimer{
 		cfg:     cfg,
@@ -92,6 +98,7 @@ func (r *Reclaimer) Pass(ctx context.Context) storage.ReclaimResult {
 	if res.Reclaimed > 0 || res.DeadLettered > 0 {
 		r.cfg.Logger.Info("durableq: reclaimed lapsed leases",
 			"reclaimed", res.Reclaimed, "dead_lettered", res.DeadLettered)
+		r.cfg.Metrics.LeasesExpired(res.Reclaimed, res.DeadLettered)
 	}
 	r.TestSignals.Pass.Emit(res)
 	return res

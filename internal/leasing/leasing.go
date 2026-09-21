@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/unilinq/durableq/internal/dqsignal"
+	"github.com/unilinq/durableq/internal/telemetry"
 	"github.com/unilinq/durableq/storage"
 )
 
@@ -28,6 +29,8 @@ type Config struct {
 	Interval time.Duration
 	Clock    storage.Clock
 	Logger   *slog.Logger
+	// Metrics receives runtime events. Nil means discard them.
+	Metrics telemetry.Sink
 }
 
 // Heartbeater renews leases for in-flight work.
@@ -60,6 +63,9 @@ func New(cfg Config) *Heartbeater {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = telemetry.Nop{}
 	}
 	return &Heartbeater{cfg: cfg, done: make(chan struct{})}
 }
@@ -103,6 +109,9 @@ func (h *Heartbeater) beat(ctx context.Context) {
 		// Losing a lease means something already reclaimed the item. The
 		// handler will find out when its own transition is rejected.
 		h.cfg.Logger.Warn("durableq: lease lost", "worker", h.cfg.Worker, "item", r.ID, "reason", r.Err)
+	}
+	if renewed > 0 {
+		h.cfg.Metrics.LeasesRenewed(h.cfg.Worker, renewed)
 	}
 	h.TestSignals.Beat.Emit(renewed)
 }

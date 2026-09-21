@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/unilinq/durableq/internal/dqsignal"
+	"github.com/unilinq/durableq/internal/telemetry"
 	"github.com/unilinq/durableq/storage"
 )
 
@@ -23,6 +24,8 @@ type SweeperConfig struct {
 	Queue  string
 	Clock  storage.Clock
 	Logger *slog.Logger
+	// Metrics receives runtime events. Nil means discard them.
+	Metrics telemetry.Sink
 }
 
 // Sweeper deletes terminal successes past their retention. It never touches
@@ -57,6 +60,9 @@ func NewSweeper(cfg SweeperConfig) *Sweeper {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = telemetry.Nop{}
 	}
 	return &Sweeper{
 		cfg:     cfg,
@@ -107,6 +113,7 @@ func (s *Sweeper) Pass(ctx context.Context) int {
 	s.breaker.Reset()
 	if n > 0 {
 		s.cfg.Logger.Info("durableq: swept completed items", "deleted", n)
+		s.cfg.Metrics.ItemsSwept(n)
 	}
 	s.TestSignals.Pass.Emit(n)
 	return n

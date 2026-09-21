@@ -347,3 +347,31 @@ status per row, and `storage.Execution.State` is documented as a lifecycle marke
 
 Also added `examples/pipeline` (the design doc's four-step job) and `DeleteItemForTest`, which exists only
 so a test can make work vanish and prove the projection notices.
+
+### 2026-09-21T09:40Z — Final regression gate on merged main — **PASS**
+
+All seven stage branches fast-forward merged into `main`. 20 consecutive full-suite runs under `-race`
+on the merged tree at commit `fc78408`:
+
+```
+FINAL GATE: 20 passed, 0 failed
+```
+
+### 2026-09-21T09:50Z — Stage 7 (telemetry) — round 1 — **PASS**
+
+Branch `stage-7-telemetry`. 6 tests.
+
+| Criterion | Evidence | Verdict |
+| --- | --- | --- |
+| Design §14 metric set emitted | `TestObserverSeesEveryOutcome` — claims with duration, starts, and finishes carrying success / filtered / retried / dead_lettered / released; plus lease renewals, lease expiries, sweeps and sampled depth | PASS |
+| Dimensions are queue / job / step / worker only | `TestObserverCarriesNoHighCardinalityIdentifiers` — a compile-time assertion on the interface shape, so adding an item id to `Observer` breaks the build | PASS |
+| No high-cardinality labels | no method takes an execution or item id; those go to logs and traces | PASS |
+| No metric on an idle poll | `TestIdlePollsEmitNothing` — five empty polls, zero claim events | PASS |
+| Outcomes a dashboard must distinguish are distinct | `TestDeadLetterAndFilteredAreDistinct` | PASS |
+| Costs nothing when unused | `TestNopObserverIsTheDefault`, `TestQueueDepthIsSampledOnlyWhenAsked` — depth sampling is the one polled gauge and is off unless an interval is set | PASS |
+
+**Design decision worth flagging.** DurableQ does **not** take an OpenTelemetry or Prometheus dependency.
+"Application and a database, nothing else" is a stated goal of the design, and the library currently
+depends only on `pgx`. Instead it defines a small `Observer` interface with a no-op default; an adapter to
+whatever the application already runs is a few lines. If you would rather have a ready-made OTel adapter,
+that is a subpackage worth adding — say the word and it is a short job.

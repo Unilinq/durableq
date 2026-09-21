@@ -30,6 +30,7 @@ import (
 	"github.com/unilinq/durableq/internal/leasing"
 	"github.com/unilinq/durableq/internal/runtime"
 	"github.com/unilinq/durableq/internal/scheduler"
+	"github.com/unilinq/durableq/internal/telemetry"
 	"github.com/unilinq/durableq/storage"
 )
 
@@ -77,6 +78,14 @@ type Config struct {
 
 	Clock  storage.Clock
 	Logger *slog.Logger
+
+	// Observer receives runtime events so the application can turn them into
+	// metrics, logs or traces. Nil discards them.
+	Observer Observer
+	// DepthInterval is how often queue depth is sampled. Depth is a gauge and
+	// cannot be derived from events, so it is the one thing that is polled.
+	// Zero disables sampling, and then no extra query is ever made.
+	DepthInterval time.Duration
 }
 
 func (c *Config) withDefaults() {
@@ -122,6 +131,9 @@ func (c *Config) withDefaults() {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
+	if c.Observer == nil {
+		c.Observer = NopObserver{}
+	}
 	if c.WorkerID == "" {
 		host, err := os.Hostname()
 		if err != nil {
@@ -146,6 +158,8 @@ type App struct {
 
 	reclaimer *scheduler.Reclaimer
 	sweeper   *scheduler.Sweeper
+	sampler   *telemetry.Sampler
+	metrics   telemetry.Sink
 }
 
 // New builds an App.
@@ -155,9 +169,10 @@ func New(cfg Config) (*App, error) {
 	}
 	cfg.withDefaults()
 	return &App{
-		cfg:    cfg,
-		queues: map[string]*Queue{},
-		jobs:   map[string]*Job{},
+		cfg:     cfg,
+		queues:  map[string]*Queue{},
+		jobs:    map[string]*Job{},
+		metrics: observerSink{cfg.Observer},
 	}, nil
 }
 
@@ -232,6 +247,18 @@ func (a *App) Start(ctx context.Context) error {
 		_ = a.sweeper.Run(runCtx)
 	}()
 
+	a.sampler = telemetry.NewSampler(telemetry.SamplerConfig{
+		Store:    a.cfg.Store,
+		Sink:     a.metrics,
+		Interval: a.cfg.DepthInterval,
+		Logger:   a.cfg.Logger,
+	})
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		_ = a.sampler.Run(runCtx)
+	}()
+
 	// Stop when the caller's context ends, so an App started with a context
 	// that is later cancelled does not keep running. The watcher also exits
 	// when Stop is called directly, otherwise Stop would wait on a context
@@ -283,6 +310,7 @@ func (a *App) Reclaimer() *scheduler.Reclaimer {
 			BatchSize: a.cfg.ReclaimBatch,
 			Clock:     a.cfg.Clock,
 			Logger:    a.cfg.Logger,
+			Metrics:   a.metrics,
 		})
 	}
 	return a.reclaimer
@@ -299,6 +327,7 @@ func (a *App) Sweeper() *scheduler.Sweeper {
 			BatchSize: a.cfg.SweepBatch,
 			Clock:     a.cfg.Clock,
 			Logger:    a.cfg.Logger,
+			Metrics:   a.metrics,
 		})
 	}
 	return a.sweeper
@@ -318,6 +347,7 @@ func (a *App) poolConfig(queue string, handler runtime.Handler, concurrency int)
 		HandlerTimeout: a.cfg.HandlerTimeout,
 		Clock:          a.cfg.Clock,
 		Logger:         a.cfg.Logger,
+		Metrics:        a.metrics,
 	}
 }
 
@@ -330,5 +360,6 @@ func (a *App) heartbeaterFor(pool *runtime.Pool) *leasing.Heartbeater {
 		Interval:      a.cfg.HeartbeatInterval,
 		Clock:         a.cfg.Clock,
 		Logger:        a.cfg.Logger,
+		Metrics:       a.metrics,
 	})
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/unilinq/durableq/internal/dqsignal"
+	"github.com/unilinq/durableq/internal/telemetry"
 	"github.com/unilinq/durableq/storage"
 )
 
@@ -54,6 +55,8 @@ type Config struct {
 
 	Clock  storage.Clock
 	Logger *slog.Logger
+	// Metrics receives runtime events. Nil means discard them.
+	Metrics telemetry.Sink
 }
 
 // Pool claims work from one queue and runs it.
@@ -133,6 +136,9 @@ func New(cfg Config) (*Pool, error) {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = telemetry.Nop{}
 	}
 	return &Pool{
 		cfg:      cfg,
@@ -220,18 +226,25 @@ func (p *Pool) pollOnce(ctx context.Context) {
 		return
 	}
 
+	started := time.Now()
 	items, err := p.cfg.Store.Claim(ctx, storage.ClaimOpts{
 		Queue:         p.cfg.Queue,
 		Worker:        p.cfg.Worker,
 		Limit:         free,
 		LeaseDuration: p.cfg.LeaseDuration,
 	})
+	took := time.Since(started)
 	if err != nil {
 		if ctx.Err() == nil {
 			p.cfg.Logger.Error("durableq: claim failed", "queue", p.cfg.Queue, "error", err)
 		}
 		p.TestSignals.Polled.Emit(0)
 		return
+	}
+	if len(items) > 0 {
+		// An empty poll emits nothing: an idle worker should not produce
+		// metric noise that looks like activity.
+		p.cfg.Metrics.ItemsClaimed(p.cfg.Queue, len(items), took)
 	}
 	for _, item := range items {
 		p.dispatch(ctx, item)
@@ -262,6 +275,8 @@ func (p *Pool) dispatch(parent context.Context, item storage.Item) {
 		defer p.wg.Done()
 		defer cancel()
 		p.TestSignals.Started.Emit(item.ID)
+		p.cfg.Metrics.ItemStarted(p.cfg.Queue, item.StepID)
+		handlerStart := time.Now()
 
 		// A handler that overruns its timeout must not hold its slot for
 		// ever: the slot is freed and the item retried, while the goroutine
@@ -286,7 +301,7 @@ func (p *Pool) dispatch(parent context.Context, item storage.Item) {
 
 		select {
 		case o := <-out:
-			p.finish(live, o.res, o.err)
+			p.finish(live, o.res, o.err, time.Since(handlerStart))
 		case <-timeout.C:
 			p.mu.Lock()
 			stopping := p.stopping
@@ -298,13 +313,16 @@ func (p *Pool) dispatch(parent context.Context, item storage.Item) {
 			}
 			cancel()
 			p.TestSignals.Stuck.Emit(item.ID)
-			p.finish(live, HandlerResult{}, fmt.Errorf("durableq: handler exceeded %s", p.cfg.HandlerTimeout))
+			p.cfg.Metrics.ItemStuck(p.cfg.Queue, item.StepID, p.cfg.HandlerTimeout)
+			p.finish(live, HandlerResult{},
+				fmt.Errorf("durableq: handler exceeded %s", p.cfg.HandlerTimeout),
+				time.Since(handlerStart))
 		}
 	}()
 }
 
 // finish turns one handler outcome into exactly one durable transition.
-func (p *Pool) finish(live *inflightItem, res HandlerResult, err error) {
+func (p *Pool) finish(live *inflightItem, res HandlerResult, err error, took time.Duration) {
 	live.finish.Do(func() {
 		defer p.forget(live.item.ID)
 
@@ -326,12 +344,17 @@ func (p *Pool) finish(live *inflightItem, res HandlerResult, err error) {
 		switch {
 		case err == nil:
 			p.ack(ctx, live.item, res)
-		case errors.Is(err, ErrDiscard):
+			outcome := telemetry.OutcomeSuccess
+			if res.Filtered {
+				outcome = telemetry.OutcomeFiltered
+			}
+			p.cfg.Metrics.ItemFinished(p.cfg.Queue, live.item.StepID, outcome, took)
+		case errors.Is(err, ErrDiscard), live.item.Policy.Exhausted(live.item.Attempt):
 			p.deadLetter(ctx, live.item, err.Error())
-		case live.item.Policy.Exhausted(live.item.Attempt):
-			p.deadLetter(ctx, live.item, err.Error())
+			p.cfg.Metrics.ItemFinished(p.cfg.Queue, live.item.StepID, telemetry.OutcomeDeadLettered, took)
 		default:
 			p.retry(ctx, live.item, err.Error())
+			p.cfg.Metrics.ItemFinished(p.cfg.Queue, live.item.StepID, telemetry.OutcomeRetried, took)
 		}
 	})
 }
@@ -348,6 +371,7 @@ func (p *Pool) releaseLive(live *inflightItem, reason string) {
 }
 
 func (p *Pool) release(item storage.Item, reason string) {
+	p.cfg.Metrics.ItemFinished(p.cfg.Queue, item.StepID, telemetry.OutcomeReleased, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	res, err := p.cfg.Store.Release(ctx, storage.ReleaseRequest{
