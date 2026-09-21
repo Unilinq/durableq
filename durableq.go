@@ -63,6 +63,15 @@ type Config struct {
 	// ReclaimBatch bounds one reclaim pass.
 	ReclaimBatch int
 
+	// Retention is how long a completed item is kept before it is swept.
+	// storage.RetentionNever keeps completed items for ever. Dead-lettered
+	// items are never swept whatever this says.
+	Retention time.Duration
+	// SweepInterval is how often retention is applied.
+	SweepInterval time.Duration
+	// SweepBatch bounds one sweep pass.
+	SweepBatch int
+
 	// DefaultPolicy applies to queues that do not set their own.
 	DefaultPolicy storage.Policy
 
@@ -95,6 +104,15 @@ func (c *Config) withDefaults() {
 	if c.ReclaimBatch <= 0 {
 		c.ReclaimBatch = 100
 	}
+	if c.Retention == 0 {
+		c.Retention = 7 * 24 * time.Hour
+	}
+	if c.SweepInterval <= 0 {
+		c.SweepInterval = time.Minute
+	}
+	if c.SweepBatch <= 0 {
+		c.SweepBatch = 1000
+	}
 	if c.DefaultPolicy.MaxAttempts == 0 && len(c.DefaultPolicy.Schedule) == 0 {
 		c.DefaultPolicy = storage.DefaultPolicy()
 	}
@@ -126,6 +144,7 @@ type App struct {
 	wg      sync.WaitGroup
 
 	reclaimer *scheduler.Reclaimer
+	sweeper   *scheduler.Sweeper
 }
 
 // New builds an App.
@@ -186,6 +205,13 @@ func (a *App) Start(ctx context.Context) error {
 		_ = a.reclaimer.Run(runCtx)
 	}()
 
+	a.sweeper = a.Sweeper()
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		_ = a.sweeper.Run(runCtx)
+	}()
+
 	// Stop when the caller's context ends, so an App started with a context
 	// that is later cancelled does not keep running. The watcher also exits
 	// when Stop is called directly, otherwise Stop would wait on a context
@@ -240,6 +266,22 @@ func (a *App) Reclaimer() *scheduler.Reclaimer {
 		})
 	}
 	return a.reclaimer
+}
+
+// Sweeper exposes retention sweeping, so an operator tool can run one pass
+// without starting the app.
+func (a *App) Sweeper() *scheduler.Sweeper {
+	if a.sweeper == nil {
+		a.sweeper = scheduler.NewSweeper(scheduler.SweeperConfig{
+			Store:     a.cfg.Store,
+			Interval:  a.cfg.SweepInterval,
+			Retention: a.cfg.Retention,
+			BatchSize: a.cfg.SweepBatch,
+			Clock:     a.cfg.Clock,
+			Logger:    a.cfg.Logger,
+		})
+	}
+	return a.sweeper
 }
 
 // poolConfig builds the runtime configuration shared by every worker.

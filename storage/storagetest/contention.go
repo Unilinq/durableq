@@ -296,3 +296,120 @@ func runContention(t *testing.T, h Harness) {
 		requireEqual(t, wins, 1, "exactly one racer may win a single item")
 	})
 }
+
+// runDLQContention covers the three-way race on a dead-lettered item: an
+// operator replaying it, the sweeper running, and a worker claiming. Exactly
+// one coherent outcome must survive, and the item must never be lost.
+func runDLQContention(t *testing.T, h Harness) {
+	t.Run("ReplaySweepAndClaimOnOneItem", func(t *testing.T) {
+		t.Parallel()
+		store, clock := h.New(t)
+
+		const items = 40
+		ids := make([]int64, 0, items)
+		for i := 0; i < items; i++ {
+			ids = append(ids, deadLetter(t, store, "recovered", "transient").ID)
+		}
+		// Well past any retention, so a sweeper that wrongly touched the DLQ
+		// would delete every one of these.
+		clock.Advance(365 * 24 * time.Hour)
+
+		var (
+			mu      sync.Mutex
+			errs    []string
+			claimed int
+		)
+		note := func(op string, err error) {
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			errs = append(errs, op+": "+err.Error())
+			mu.Unlock()
+		}
+
+		var wg sync.WaitGroup
+		for r := 0; r < 4; r++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 10; i++ {
+					_, err := store.Replay(context.Background(), storage.ReplayOpts{
+						Queue: "recovered" + storage.DLQSuffix, Limit: 5,
+					})
+					note("replay", err)
+				}
+			}()
+		}
+		for s := 0; s < 2; s++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 20; i++ {
+					_, err := store.Sweep(context.Background(), storage.SweepOpts{
+						Retention: time.Hour, Limit: 100,
+					})
+					note("sweep", err)
+				}
+			}()
+		}
+		for c := 0; c < 4; c++ {
+			wg.Add(1)
+			go func(c int) {
+				defer wg.Done()
+				for i := 0; i < 20; i++ {
+					got, err := store.Claim(context.Background(), storage.ClaimOpts{
+						Queue: "recovered", Worker: "rc-" + itoa(c), Limit: 5,
+						LeaseDuration: time.Minute,
+					})
+					note("claim", err)
+					if len(got) == 0 {
+						continue
+					}
+					reqs := make([]storage.CompleteRequest, 0, len(got))
+					for _, it := range got {
+						reqs = append(reqs, storage.CompleteRequest{ID: it.ID, Worker: "rc-" + itoa(c)})
+					}
+					res, err := store.Complete(context.Background(), reqs...)
+					note("complete", err)
+					mu.Lock()
+					for _, r := range res {
+						if r.Err == nil {
+							claimed++
+						}
+					}
+					mu.Unlock()
+				}
+			}(c)
+		}
+		wg.Wait()
+
+		mu.Lock()
+		defer mu.Unlock()
+		for _, e := range errs {
+			if strings.Contains(e, "40P01") {
+				t.Fatalf("deadlock during DLQ contention: %s", e)
+			}
+		}
+		if len(errs) > 0 {
+			t.Fatalf("errors during DLQ contention:\n%s", strings.Join(errs, "\n"))
+		}
+
+		// Every item must still be accounted for: nothing deleted by the
+		// sweeper, nothing duplicated by a racing replay.
+		seen := map[storage.State]int{}
+		for _, id := range ids {
+			it, err := store.GetItem(context.Background(), id)
+			if err != nil {
+				t.Fatalf("item %d disappeared during replay/sweep/claim contention: %v", id, err)
+			}
+			seen[it.State]++
+		}
+		total := seen[storage.StateReady] + seen[storage.StateRunning] +
+			seen[storage.StateDone] + seen[storage.StateDLQ]
+		requireEqual(t, total, items, "every item still accounted for")
+		if seen[storage.StateDone] != claimed {
+			t.Fatalf("completed %d items but %d are marked done", claimed, seen[storage.StateDone])
+		}
+	})
+}

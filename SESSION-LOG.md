@@ -151,3 +151,56 @@ deadline moves by exactly the elapsed time.
 exactly, and validates the signature at registration (`TestHandlerSignatureIsCheckedAtRegistration`
 rejects seven wrong shapes). `T` may be any JSON-decodable type, `[]byte`/`json.RawMessage` for the raw
 payload, or `storage.Item` for the whole item.
+
+### 2026-09-21T08:46Z — Stage 4 (DLQ, replay, retention, CLI) — round 1 — **PASS**
+
+Branch `stage-4-dlq-replay-cli`.
+
+| Criterion | Evidence | Verdict |
+| --- | --- | --- |
+| 1. Exhausted item carries error, attempts, worker | CLI `item 16`: `attempts 2 of 2`, worker `Mac-65403`, error `unsupported_pdf_encoding`, plus the two attempt rows | PASS |
+| 2. Replay returns the item and it succeeds | `Replay/ReturnsItemsToTheWorkingQueue` — back to ready on the working queue, attempt reset to 0, claimable again | PASS |
+| 3. Replay filtered and limited | `Replay/HonoursItsLimit`, `Replay/FiltersByError` (2 of 3 by error substring); CLI `dlq replay -limit 2` moved exactly 2 | PASS |
+| 4. Sweeper deletes only terminal items past retention | `Sweep/DeletesDoneItemsPastRetention` | PASS |
+| 5. Retention `-1` means never | `Sweep/RetentionNeverDeletesNothing`, `TestSweeperDoesNothingWhenRetentionIsNever` (store never called) | PASS |
+| 6. DLQ is never auto-swept | `Sweep/NeverSweepsTheDLQ` (a year past retention); CLI `gc -retention 0s` deleted 16 done items, left 2 DLQ items | PASS |
+| 7. Sweeper never races a live lease | `Sweep/NeverSweepsLiveWork` — ready and running items survive a year-past-retention sweep | PASS |
+| 8. Bounded batches, circuit breaker | `Sweep/HonoursBatchLimit`; `TestSweeperBreakerShrinksAndRecovers`; `TestBreakerHalvesAndRecovers` | PASS |
+| 9. Respects cancellation, repeatable | `Sweeper.Run` selects on ctx; `Pass` is idempotent and separately exported for the CLI | PASS |
+| 10. CLI verbs correct against a seeded database | full transcript below | PASS |
+| 11. Replay/sweep/claim race on one item | `DLQContention/ReplaySweepAndClaimOnOneItem` — 4 replayers, 2 sweepers, 4 claimers over 40 items; every item accounted for, done-count matches completions, no deadlock | PASS |
+| 12. `-race -count=1` clean | all five packages ok | PASS |
+
+CLI transcript (schema `dq_cli_demo2`, seeded by `examples/queue -count 20`, since dropped):
+```
+$ durableq queues
+QUEUE         READY  RUNNING  DONE  DLQ  PAUSED
+indexing      0      0        16    0    false
+indexing.dlq  0      0        0     4    false
+
+$ durableq dlq ls indexing.dlq
+ID  ATTEMPTS  WORKER     FAILED AT             ERROR
+16  2         Mac-65403  2026-09-21T08:45:26Z  unsupported_pdf_encoding
+...
+
+$ durableq item 16
+item 16 / queue indexing.dlq / state dlq / outcome dlq / attempts 2 of 2
+ATTEMPT  WORKER     STARTED               OUTCOME  ERROR
+1        Mac-65403  2026-09-21T08:45:26Z  error    unsupported_pdf_encoding
+2        Mac-65403  2026-09-21T08:45:26Z  dlq      unsupported_pdf_encoding
+
+$ durableq pause indexing   -> paused    (queues shows PAUSED true)
+$ durableq resume indexing  -> resumed
+$ durableq dlq replay indexing.dlq -limit 2  -> replayed 2 items
+$ durableq dlq replay indexing.dlq -error-contains connection_refused -> replayed 0
+$ durableq gc -retention 0s -> deleted 16 completed items; DLQ untouched (2 remain)
+$ durableq migrate status -> applied 1, latest 1
+```
+
+One test was wrong rather than the code: `Replay/DoesNotTouchRunningOrReadyItems` enqueued the "ready"
+item first and then claimed, but claiming takes the *oldest* item, so it claimed the one the test meant to
+leave alone. Reordered, with a comment saying why the order matters.
+
+Also added: `examples/queue` (a runnable demo that seeds a schema, used for the CLI evidence above) and
+`storage.Lister` (`ListItems` / `Attempts`) so the CLI can show a DLQ and an item's history without
+widening the hot-path `Store` interface.

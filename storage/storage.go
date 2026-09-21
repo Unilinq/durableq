@@ -283,6 +283,33 @@ type ReclaimResult struct {
 	DeadLettered int
 }
 
+// ItemFilter narrows a listing of items.
+type ItemFilter struct {
+	Queue         string
+	State         State
+	ExecutionID   string
+	ItemID        string
+	ErrorContains string
+	Limit         int
+}
+
+// Attempt is one recorded try at an item.
+type Attempt struct {
+	Attempt   int
+	Worker    string
+	StartedAt time.Time
+	EndedAt   time.Time
+	Outcome   string
+	Error     string
+}
+
+// Lister is implemented by stores that can enumerate items. It is separate
+// from Store so the hot path stays small.
+type Lister interface {
+	ListItems(ctx context.Context, f ItemFilter) ([]Item, error)
+	Attempts(ctx context.Context, id int64) ([]Attempt, error)
+}
+
 // QueueStat is a point-in-time count for one queue.
 type QueueStat struct {
 	Queue   string
