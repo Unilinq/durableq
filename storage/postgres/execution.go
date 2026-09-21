@@ -34,9 +34,17 @@ func (s *Store) CreateExecution(ctx context.Context, exec storage.Execution, ste
 		for _, st := range steps {
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO `+s.tbl("durableq_steps")+
-					` (execution_id, step_id, idx, queue, next_queue) VALUES ($1,$2,$3,$4,$5)`,
-				exec.ID, st.StepID, st.Idx, st.Queue, nullable(st.NextQueue)); err != nil {
+					` (execution_id, step_id, idx, queue) VALUES ($1,$2,$3,$4)`,
+				exec.ID, st.StepID, st.Idx, st.Queue); err != nil {
 				return err
+			}
+			for _, to := range st.Next {
+				if _, err := tx.Exec(ctx,
+					`INSERT INTO `+s.tbl("durableq_step_edges")+
+						` (execution_id, from_step_id, to_step_id) VALUES ($1,$2,$3)`,
+					exec.ID, st.StepID, to); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -86,30 +94,51 @@ func (s *Store) ListExecutions(ctx context.Context, limit int) ([]storage.Execut
 	return out, rows.Err()
 }
 
-// ExecutionSteps returns the pipeline shape recorded for an execution.
+// ExecutionSteps returns the pipeline shape recorded for an execution. Edges
+// are authoritative for topology, so this is a left join against them:
+// idx orders the steps, not the graph.
 func (s *Store) ExecutionSteps(ctx context.Context, id string) ([]storage.StepDef, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT step_id, idx, queue, next_queue FROM `+s.tbl("durableq_steps")+
-			` WHERE execution_id = $1 ORDER BY idx`, id)
+	rows, err := s.pool.Query(ctx, `
+		SELECT st.step_id, st.idx, st.queue, e.to_step_id
+		FROM `+s.tbl("durableq_steps")+` st
+		LEFT JOIN `+s.tbl("durableq_step_edges")+` e
+		       ON e.execution_id = st.execution_id AND e.from_step_id = st.step_id
+		WHERE st.execution_id = $1
+		ORDER BY st.idx, e.to_step_id`, id)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []storage.StepDef
+
+	order := make([]string, 0)
+	byID := map[string]*storage.StepDef{}
 	for rows.Next() {
 		var (
-			st   storage.StepDef
-			next *string
+			stepID, queue string
+			idx           int
+			to            *string
 		)
-		if err := rows.Scan(&st.StepID, &st.Idx, &st.Queue, &next); err != nil {
+		if err := rows.Scan(&stepID, &idx, &queue, &to); err != nil {
 			return nil, err
 		}
-		if next != nil {
-			st.NextQueue = *next
+		def, ok := byID[stepID]
+		if !ok {
+			def = &storage.StepDef{StepID: stepID, Idx: idx, Queue: queue}
+			byID[stepID] = def
+			order = append(order, stepID)
 		}
-		out = append(out, st)
+		if to != nil {
+			def.Next = append(def.Next, *to)
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]storage.StepDef, 0, len(order))
+	for _, id := range order {
+		out = append(out, *byID[id])
+	}
+	return out, nil
 }
 
 // StepCounts derives the per-step tallies for an execution from durable item

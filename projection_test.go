@@ -225,7 +225,7 @@ func TestProjectionSurfacesCappedDiscovery(t *testing.T) {
 	}
 	if err := es.CreateExecution(ctx, storage.Execution{ID: execID, Job: "capped"},
 		[]storage.StepDef{
-			{StepID: "discover", Idx: 0, Queue: "capped.discover", NextQueue: "capped.crawl"},
+			{StepID: "discover", Idx: 0, Queue: "capped.discover", Next: []string{"crawl"}},
 			{StepID: "crawl", Idx: 1, Queue: "capped.crawl"},
 		}); err != nil {
 		t.Fatalf("CreateExecution: %v", err)

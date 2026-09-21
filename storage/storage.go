@@ -336,11 +336,16 @@ const (
 
 // StepDef records one step of a job for one execution, so lineage and
 // projections can be read back without the job definition being in memory.
+//
+// Next names this step's successors. A linear job has at most one; a step
+// with several is a fan-out, broadcasting its output to every successor as
+// its own item on that successor's queue. Edges are authoritative for
+// topology: Idx is for stable display ordering only.
 type StepDef struct {
-	StepID    string
-	Idx       int
-	Queue     string
-	NextQueue string
+	StepID string
+	Idx    int
+	Queue  string
+	Next   []string
 }
 
 // LineageEntry is what happened to one item at one step. A step the item never
