@@ -90,3 +90,25 @@ Unique-job/dedup keys (`dbunique`), leader election (`leadership/elector_test.go
 4. **Add batch-size circuit breakers** to the reclaimer and sweeper.
 5. **Schema-qualified statements from day one**, with an `AlternateSchema` subtest in the conformance suite.
 6. **Graceful-stop must return work without consuming an attempt** — make it an explicit invariant in the storage contract.
+
+## 5. Concurrency coverage (first-pass requirement)
+
+The first pass is Postgres-only and must be proven under contention, so the race scenarios below are a
+gated stage (plan stage 4a) rather than a later hardening pass. River's own suite supplies the shape for
+most of them.
+
+| Scenario | Invariant asserted | River precedent |
+| --- | --- | --- |
+| N workers drain one queue | every item claimed by exactly one worker at a time; successes == items | `SKIP LOCKED` claim path, driver suite |
+| Worker acks after its lease expired | item is not both completed and re-queued; one outcome wins atomically | `JobSetStateIfRunningMany` "running only" guards |
+| Reclaimer vs owning worker | reclaim adjusts attempt correctly; no lost or double increment | `SetsAnInterruptedRunningJobToAvailableWithUpdatedAttempt` |
+| Ack / retry / cancel issued together | all orderings exercised via test signals; single terminal state | `rivershared/testsignal` |
+| Item becoming ready while a claimer scans | not claimed twice, not skipped indefinitely | `ErrorSetsJobAvailableBelowSchedulerIntervalThreshold` |
+| Replay vs sweep vs claim on one DLQ item | sweeper never removes an item under a live lease | `DoesNotDeleteARunningJob`, `IgnoresRunningJobs` |
+| Ack-N + enqueue-N+1 with the tx killed mid-way | no orphan, no duplicate downstream item | none — ours |
+| Sustained mixed workload, 60s | zero PG deadlocks (`40P01`) | none — ours |
+| Start/stop stress on every background service | no shutdown race, no leaked goroutine | `startstoptest.Stress`, `StartStopStress` subtests |
+| Worker SIGKILL mid-lease | work reclaimed exactly once | `RescuesStuckJobs` |
+| Pool exhaustion, connection dropped mid-claim | typed error, item left claimable | `CompletionImmediateFailureOnErrClosedPool` |
+
+Gate: the whole suite green under `-race`, run 20× consecutively with no intermittent.
