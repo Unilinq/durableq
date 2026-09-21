@@ -27,10 +27,11 @@ type Job struct {
 	app  *App
 	name string
 
-	mu       sync.Mutex
-	steps    []*Step
-	wired    bool
-	buildErr error
+	mu         sync.Mutex
+	steps      []*Step
+	wired      bool
+	buildErr   error
+	successors map[string][]string
 }
 
 // Step is one stage of a job.
@@ -40,6 +41,12 @@ type Step struct {
 	raw         any
 	concurrency int
 	policy      storage.Policy
+
+	// afterSet is true once After has been called, even with no arguments.
+	// That distinguishes "no After was given, use the declaration-order
+	// default" from "explicitly given no predecessor".
+	afterSet bool
+	after    []string
 }
 
 // StepOption configures one step.
@@ -50,6 +57,23 @@ func StepConcurrency(n int) StepOption { return func(s *Step) { s.concurrency = 
 
 // StepPolicy overrides the retry policy for work on this step's queue.
 func StepPolicy(p Policy) StepOption { return func(s *Step) { s.policy = p } }
+
+// After names this step's predecessor. A step with no After keeps today's
+// behaviour: its predecessor is the step declared before it (the first step
+// has none). Two steps naming the same After is a fan-out and is valid: each
+// is its own successor queue, and the predecessor's output is broadcast to
+// both.
+//
+// After naming an unknown step, or naming more than one, is a build error
+// caught by wire(), not accepted silently - a join (more than one
+// predecessor) is a different feature with different delivery semantics,
+// reserved for later.
+func After(steps ...string) StepOption {
+	return func(s *Step) {
+		s.afterSet = true
+		s.after = append([]string(nil), steps...)
+	}
+}
 
 // Job returns the named job, creating it on first use.
 func (a *App) Job(name string) *Job {
@@ -131,12 +155,34 @@ func (j *Job) wire() error {
 		return fmt.Errorf("durableq: job %q has no steps", j.name)
 	}
 
+	nodes := make([]stepNode, len(j.steps))
 	for i, step := range j.steps {
-		var next *Step
-		if i+1 < len(j.steps) {
-			next = j.steps[i+1]
+		after := step.after
+		if !step.afterSet {
+			if i > 0 {
+				after = []string{j.steps[i-1].id}
+			} else {
+				after = nil
+			}
 		}
-		h, err := makeStepHandler(step.raw, next)
+		nodes[i] = stepNode{id: step.id, after: after}
+	}
+	successors, err := buildStepGraph(nodes)
+	if err != nil {
+		return fmt.Errorf("durableq: job %q: %w", j.name, err)
+	}
+
+	byID := make(map[string]*Step, len(j.steps))
+	for _, s := range j.steps {
+		byID[s.id] = s
+	}
+
+	for _, step := range j.steps {
+		var nexts []*Step
+		for _, id := range successors[step.id] {
+			nexts = append(nexts, byID[id])
+		}
+		h, err := makeStepHandler(step.raw, nexts)
 		if err != nil {
 			return fmt.Errorf("durableq: job %q step %q: %w", j.name, step.id, err)
 		}
@@ -147,6 +193,7 @@ func (j *Job) wire() error {
 			return fmt.Errorf("durableq: job %q step %q: %w", j.name, step.id, err)
 		}
 	}
+	j.successors = successors
 	j.wired = true
 	return nil
 }
@@ -170,8 +217,8 @@ func (j *Job) Run(ctx context.Context, input any) (storage.Execution, error) {
 	steps := make([]storage.StepDef, 0, len(j.steps))
 	for i, s := range j.steps {
 		def := storage.StepDef{StepID: s.id, Idx: i, Queue: s.queue}
-		if i+1 < len(j.steps) {
-			def.NextQueue = j.steps[i+1].queue
+		if next := j.successors[s.id]; len(next) > 0 {
+			def.Next = append([]string(nil), next...)
 		}
 		steps = append(steps, def)
 	}
@@ -208,10 +255,11 @@ func (j *Job) Run(ctx context.Context, input any) (storage.Execution, error) {
 }
 
 // makeStepHandler adapts a step handler to the runtime contract and wires its
-// output into the next step's queue, carrying that step's retry policy onto
-// the work it creates. A downstream item is governed by the step that will run
-// it, not by the step that produced it.
-func makeStepHandler(handler any, next *Step) (runtime.Handler, error) {
+// output into every successor's queue - one broadcast item per successor per
+// payload - carrying each successor's own retry policy onto the work it
+// creates. A downstream item is governed by the step that will run it, not by
+// the step that produced it.
+func makeStepHandler(handler any, nexts []*Step) (runtime.Handler, error) {
 	if handler == nil {
 		return nil, errors.New("step handler is nil")
 	}
@@ -240,7 +288,7 @@ func makeStepHandler(handler any, next *Step) (runtime.Handler, error) {
 		return nil, fmt.Errorf(
 			"step handler must return error, (T, error) or ([]T, error), got %s", t)
 	}
-	if (fanOut || single) && next == nil {
+	if (fanOut || single) && len(nexts) == 0 {
 		return nil, fmt.Errorf(
 			"the last step produces output but has nowhere to send it; "+
 				"add another step or return only error (got %s)", t)
@@ -273,30 +321,34 @@ func makeStepHandler(handler any, next *Step) (runtime.Handler, error) {
 			return runtime.HandlerResult{Filtered: true}, nil
 		}
 
-		produced := make([]storage.NewItem, 0, len(payloads))
+		produced := make([]storage.NewItem, 0, len(payloads)*len(nexts))
 		for _, p := range payloads {
 			raw, err := encodePayload(p.Interface())
 			if err != nil {
 				return runtime.HandlerResult{}, fmt.Errorf("durableq: encoding step output: %w", err)
 			}
-			policy := next.policy
-			child := storage.NewItem{
-				Queue:        next.queue,
-				Payload:      raw,
-				Policy:       &policy,
-				ExecutionID:  item.ExecutionID,
-				StepID:       next.id,
-				ParentItemID: item.ItemID,
-			}
 			// One output means the same logical item moved on, so it keeps its
 			// identity and a lineage query follows it end to end. Several
-			// outputs are new items pointing back at their parent.
+			// outputs are new items pointing back at their parent. That
+			// identity is per payload, not per successor: broadcasting one
+			// payload to several successors is one logical item entering
+			// several branches, which is exactly what lineage should show.
+			payloadItemID := newItemID()
 			if len(payloads) == 1 {
-				child.ItemID = item.ItemID
-			} else {
-				child.ItemID = newItemID()
+				payloadItemID = item.ItemID
 			}
-			produced = append(produced, child)
+			for _, next := range nexts {
+				policy := next.policy
+				produced = append(produced, storage.NewItem{
+					Queue:        next.queue,
+					Payload:      raw,
+					Policy:       &policy,
+					ExecutionID:  item.ExecutionID,
+					StepID:       next.id,
+					ItemID:       payloadItemID,
+					ParentItemID: item.ItemID,
+				})
+			}
 		}
 		return runtime.HandlerResult{Produced: produced}, nil
 	}, nil
