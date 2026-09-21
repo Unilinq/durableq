@@ -250,3 +250,48 @@ sibling tests with `57P01`. Destructive chaos now runs in a database of its own
 **Soak duration.** `SustainedMixedLoad` runs 3s by default and 60s under `DURABLEQ_RACE_SOAK=1`. The 60s
 form was run once for the criterion-8 evidence above; the 20x gate used the default so the gate itself
 stays runnable. Both are recorded here rather than one standing in for the other.
+
+### 2026-09-21T09:20Z — Stage 5 (Job, Execution, lineage) — round 1 — **PASS**
+
+Branch `stage-5-job-execution`. 9 job tests, green at `-count=3`; stage 4a suite still green (regression).
+
+| Criterion | Evidence | Verdict |
+| --- | --- | --- |
+| 1. Four-step job creates its queues and one execution per Run | `TestJobRunsAFourStepPipeline` (the design doc's discover→crawl→process→index, 12 pages), `TestJobCreatesOneQueuePerStep` asserts the exact recorded `StepDef`s | PASS |
+| 2. Lineage carried across every hand-off, durable | `TestLineageFollowsAnItemAcrossSteps`; `execution_id`/`step_id`/`item_id`/`parent_item_id` are columns, read back by `Lineage()` | PASS |
+| 3. Per-item trace matches design §10 | same test: crawl done, process DLQ after 2 attempts, index **never entered** (reported as `Entered:false`, not omitted) | PASS |
+| 4. Dead-lettered item produces nothing downstream; others continue | `TestDeadLetteredItemProducesNothingDownstream` — 10 items, 2 fail, sink receives exactly 8 | PASS |
+| 5. Fan-out 1→N recorded on the edge | `TestJobRunsAFourStepPipeline` (1→12), `TestFanOutOfOneKeepsItemIdentity` | PASS |
+| 6. Fan-out 1→0 is `filtered`, distinct from success | `TestFilteredStepIsTerminalSuccess` — 3 received, 2 succeeded, 1 filtered, 0 dlq, and the edge invariant still balances | PASS |
+| 7. Ack + enqueue atomicity | stage 4a `TestFanOutSurvivesConnectionLoss` (359 acked = 359 downstream across 4257 killed connections); the job layer uses that same `Complete` | PASS |
+| 8. Concurrent executions do not cross-contaminate | `TestConcurrentExecutionsDoNotMix` — two runs of one job, counts and lineage separate | PASS |
+| 9. `-race -count=1` clean, earlier stages still green | all six packages ok; stage 4a suite included | PASS |
+
+One genuine defect, found by the tests and fixed:
+
+**Downstream items did not inherit their target step's retry policy.** `makeStepHandler` built child items
+with no policy, so they fell back to the store default (5 attempts, 5s→10m backoff) instead of the policy
+the receiving step declared. Two tests stalled with items sitting ready behind a backoff that the stub
+clock would never reach. Fixed by passing the *next* step into `makeStepHandler`: a downstream item is
+governed by the step that will run it, not by the step that produced it. This would have been a
+confusing production bug — a step's configured policy silently ignored for everything but the first step.
+
+**One architecture rule corrected.** `TestCoreDoesNotImportABackend` also counted test imports, so adding
+`postgres` to an in-package test file failed it. The rule now checks shipped code only, with a comment
+saying why: a test must name a backend to have something to run against; what matters is that the
+library a user compiles does not drag one in. Re-verified by negative control — library code importing a
+backend still fails.
+
+**One refinement to stage 3's shutdown path.** A handler that *finished successfully* during a graceful
+stop is now acked rather than released. Releasing it was safe but wasteful: it threw away completed work
+so the item ran twice. Work interrupted by shutdown is still released without consuming an attempt, which
+is what the criterion requires.
+
+**Deviation from the design doc, recorded deliberately.** The doc says a four-step job has three internal
+queues. DurableQ gives the first step a queue as well (four queues for four steps), so the trigger itself
+is durable and a job invocation survives the process that created it. `TestJobCreatesOneQueuePerStep`
+pins this.
+
+**Lineage rule.** A step producing exactly one output passes its `item_id` on, so a lineage query follows
+one logical item end to end. A step producing several gives each child a new `item_id` with
+`parent_item_id` pointing back. `TestFanOutOfOneKeepsItemIdentity` pins both halves.

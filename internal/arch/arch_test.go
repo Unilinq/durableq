@@ -38,8 +38,12 @@ func backendImportAllowed(pkg string) bool {
 	return false
 }
 
-// TestCoreDoesNotImportABackend walks every package's imports and fails if a
-// core package reaches for a concrete storage adapter.
+// TestCoreDoesNotImportABackend walks the imports of every package's shipped
+// code and fails if a core package reaches for a concrete storage adapter.
+//
+// Test files are exempt: a test must name a backend to have something to run
+// against. What matters is that the library a user compiles does not drag a
+// backend in, and that is decided by the non-test imports.
 func TestCoreDoesNotImportABackend(t *testing.T) {
 	t.Parallel()
 	for pkg, imports := range packageImports(t) {
@@ -64,8 +68,9 @@ func TestCoreDoesNotImportABackend(t *testing.T) {
 // any particular one.
 func TestStorageTestIsBackendAgnostic(t *testing.T) {
 	t.Parallel()
-	imports := packageImports(t)[modulePath+"/storagetest"]
-	for _, imp := range append(imports, packageImports(t)[modulePath+"/storage/storagetest"]...) {
+	all := packageImports(t)
+	imports := append(all[modulePath+"/storagetest"], all[modulePath+"/storage/storagetest"]...)
+	for _, imp := range imports {
 		for _, backend := range backendPackages {
 			if imp == backend {
 				t.Errorf("storagetest imports %s; the conformance suite must stay backend-agnostic", backend)
@@ -126,12 +131,13 @@ func TestNoSleepForSynchronisation(t *testing.T) {
 	}
 }
 
-// packageImports returns every package in the module and what it imports,
-// including its test files.
+// packageImports returns every package in the module and what its shipped code
+// imports. Test-only imports are deliberately excluded; see
+// TestCoreDoesNotImportABackend for why.
 func packageImports(t *testing.T) map[string][]string {
 	t.Helper()
 	cmd := exec.Command("go", "list", "-e",
-		"-f", "{{.ImportPath}}\t{{join .Imports \",\"}},{{join .TestImports \",\"}},{{join .XTestImports \",\"}}",
+		"-f", "{{.ImportPath}}\t{{join .Imports \",\"}}",
 		"./...")
 	cmd.Dir = repoRoot(t)
 	out, err := cmd.Output()

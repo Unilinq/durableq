@@ -14,6 +14,7 @@ import (
 	"github.com/unilinq/durableq/internal/leasing"
 	"github.com/unilinq/durableq/internal/runtime"
 	"github.com/unilinq/durableq/storage"
+	"github.com/unilinq/durableq/storage/postgres"
 )
 
 // testApp wires an app against an isolated schema with a poll interval short
@@ -21,18 +22,14 @@ import (
 // item scheduling is driven explicitly.
 type testApp struct {
 	*App
-	store *storageWrapper
+	store *postgres.Store
 	clock *dqtest.StubClock
-}
-
-type storageWrapper struct {
-	storage.Store
 }
 
 func newTestApp(t *testing.T, mutate ...func(*Config)) *testApp {
 	t.Helper()
 	clock := dqtest.NewStubClockNow()
-	store := &storageWrapper{Store: dqtest.NewStore(t, clock)}
+	store := dqtest.NewStore(t, clock)
 
 	cfg := Config{
 		Store:             store,

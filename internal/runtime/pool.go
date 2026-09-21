@@ -311,7 +311,11 @@ func (p *Pool) finish(live *inflightItem, res HandlerResult, err error) {
 		p.mu.Lock()
 		soft := live.softStop
 		p.mu.Unlock()
-		if soft {
+		if soft && err != nil {
+			// The handler did not finish, and it did not finish because the
+			// process is stopping. Hand the work back without spending the
+			// attempt. A handler that *did* finish is acked below: throwing
+			// away completed work would only make it run twice.
 			p.releaseLive(live, "shutting down")
 			return
 		}

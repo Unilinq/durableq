@@ -310,6 +310,73 @@ type Lister interface {
 	Attempts(ctx context.Context, id int64) ([]Attempt, error)
 }
 
+// Execution is one invocation of a Job.
+type Execution struct {
+	ID        string
+	Job       string
+	State     string
+	Input     []byte
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// Execution states.
+const (
+	ExecutionRunning  = "running"
+	ExecutionComplete = "complete"
+)
+
+// StepDef records one step of a job for one execution, so lineage and
+// projections can be read back without the job definition being in memory.
+type StepDef struct {
+	StepID    string
+	Idx       int
+	Queue     string
+	NextQueue string
+}
+
+// LineageEntry is what happened to one item at one step. A step the item never
+// reached is reported with Entered false rather than omitted, because "never
+// entered" is the answer to a real question.
+type LineageEntry struct {
+	StepID   string
+	Idx      int
+	Entered  bool
+	ItemPK   int64
+	State    State
+	Outcome  Outcome
+	Attempt  int
+	Error    string
+	Produced int
+}
+
+// StepCount is the per-edge tally a projection is built from. Every field is
+// derived from durable item state, never from an in-memory counter.
+type StepCount struct {
+	StepID    string
+	Idx       int
+	Queue     string
+	Received  int
+	Succeeded int
+	Filtered  int
+	DLQ       int
+	Active    int
+	Produced  int
+	Dropped   int
+	Capped    int
+}
+
+// ExecutionStore is implemented by stores that carry the job layer. It is
+// separate from Store so a plain queue deployment need not provide it.
+type ExecutionStore interface {
+	CreateExecution(ctx context.Context, exec Execution, steps []StepDef) error
+	GetExecution(ctx context.Context, id string) (Execution, error)
+	ListExecutions(ctx context.Context, limit int) ([]Execution, error)
+	ExecutionSteps(ctx context.Context, id string) ([]StepDef, error)
+	StepCounts(ctx context.Context, executionID string) ([]StepCount, error)
+	Lineage(ctx context.Context, executionID, itemID string) ([]LineageEntry, error)
+}
+
 // QueueStat is a point-in-time count for one queue.
 type QueueStat struct {
 	Queue   string

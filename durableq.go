@@ -138,6 +138,7 @@ type App struct {
 
 	mu      sync.Mutex
 	queues  map[string]*Queue
+	jobs    map[string]*Job
 	started bool
 	stopped bool
 	cancel  context.CancelFunc
@@ -156,6 +157,7 @@ func New(cfg Config) (*App, error) {
 	return &App{
 		cfg:    cfg,
 		queues: map[string]*Queue{},
+		jobs:   map[string]*Job{},
 	}, nil
 }
 
@@ -177,6 +179,24 @@ func (a *App) Start(ctx context.Context) error {
 		return errors.New("durableq: already started")
 	}
 	a.started = true
+	jobs := make([]*Job, 0, len(a.jobs))
+	for _, j := range a.jobs {
+		jobs = append(jobs, j)
+	}
+	a.mu.Unlock()
+
+	// Jobs register their step queues here, so a job defined before Start has
+	// its workers running after it.
+	for _, j := range jobs {
+		if err := j.wire(); err != nil {
+			a.mu.Lock()
+			a.started = false
+			a.mu.Unlock()
+			return err
+		}
+	}
+
+	a.mu.Lock()
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	a.cancel = cancel
 	queues := make([]*Queue, 0, len(a.queues))
