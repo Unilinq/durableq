@@ -99,3 +99,55 @@ text. The real check is `grep -ciE "deadlock detected|40P01"`. Stage 4a uses the
   reserved for administrative paths such as the CLI.
 - `Release` deletes the open attempt row rather than closing it: a shutdown hand-back did not consume an
   attempt, so it should leave no trace in the attempt history either.
+
+### 2026-09-21T08:42Z — Stage 3 (polling worker, public Queue API) — round 1 — **PASS**
+
+Branch `stage-3-worker-queue-api`. 16 tests, all green at `-count=5`.
+
+| Criterion | Evidence | Verdict |
+| --- | --- | --- |
+| 1. Concurrency cap holds under load | `TestConcurrencyCapHolds` — 40 items, cap 4, high-water mark asserted via the pool's concurrency signal | PASS |
+| 2. Ack and claim overlap without deadlock | `TestConcurrencyCapHolds` + `TestWorkerProcessesItems`; no deadlocks in the mixed-load suite | PASS |
+| 3. Graceful stop returns work **without consuming an attempt** | `TestGracefulStopDoesNotConsumeAnAttempt` — attempt 1 while running, 0 after Stop, state ready | PASS |
+| 4. Panic is a normal failure path | `TestPanicIsANormalFailurePath` — 2 retries then DLQ, handler ran exactly 3 times | PASS |
+| 5. Stuck handler does not hold its slot | `TestStuckHandlerFreesItsSlot` — wedged handler ignores cancellation, ordinary work still flows | PASS |
+| 6. Shutdown is not "stuck" | `TestShutdownIsNotMistakenForAStuckHandler` — stuck signal empty, item released, attempt 0 | PASS |
+| 7. Unhandled queue fails the item, not the worker | `TestQueueWithoutAHandlerIsNotClaimed` — producer-only queue left waiting, 0 dead-lettered | PASS |
+| 8. Undecodable payload retried then dead-lettered | `TestUndecodablePayloadDeadLettersEventually` — handler body ran 0 times, item reached DLQ with a recorded error | PASS |
+| 9. Short retry not lost between poll ticks | `TestRetryBecomingReadyIsPickedUp` — item returns purely because the clock advanced | PASS |
+| 10. Poll jitter spreads polls | `TestPollJitterSpreadsPolls` — 21 samples inside +/-20%, >=10 distinct, floor honoured | PASS |
+| 11. Pause/resume mid-operation | `TestPauseStopsClaiming` — five consecutive empty polls while paused, flows again after resume | PASS |
+| 12. Heartbeat renews a long handler's lease | `TestHeartbeatKeepsALongHandlersLease` — deadline moves by exactly the time that passed; reclaimer takes 0 | PASS |
+| 13. Start/stop stress, no goroutine leak | `TestStartStopStress` — 8 cycles, double-Stop safe, goroutine growth bounded | PASS |
+| 14. `-race -count=1` clean | see below | PASS |
+
+```
+go test ./... -race -count=1
+  ok  github.com/unilinq/durableq                 1.850s
+  ok  github.com/unilinq/durableq/internal/arch   1.412s
+  ok  github.com/unilinq/durableq/internal/dqsignal 1.581s
+  ok  github.com/unilinq/durableq/internal/scheduler 1.452s
+  ok  github.com/unilinq/durableq/storage/postgres 3.204s
+go test . -race -count=5   -> ok 3.609s
+```
+
+Three defects found during the stage, all fixed before the verdict:
+
+1. **`App.Stop` could hang for ever.** `Start`'s context watcher waited only on the caller's context, so
+   `Stop` called while that context was still live blocked on `a.wg.Wait()`. Caught as a 90s test timeout.
+   Fixed: the watcher selects on the caller's context *or* the app's own cancellation.
+2. **Data race in `scheduler.Breaker`** (`-race`, `TestHeartbeat...`). `Reclaimer.Pass` is exported so an
+   operator can run one pass by hand; doing that while the loop runs raced on the batch size. Fixed with a
+   mutex plus `breaker_test.go`, including an explicit concurrency case. This is exactly the class of bug
+   the race gate exists to catch, found two stages early.
+3. **Missing `Config.HeartbeatInterval`.** Renewal was hard-wired to `LeaseDuration/3`, so a 30s lease
+   forced a 10s renewal. Now configurable, defaulting to a third.
+
+One test was wrong rather than the code: the first heartbeat test asserted renewal with a frozen stub
+clock, where a no-op renewal is the correct behaviour. Rewritten to advance the clock and assert the
+deadline moves by exactly the elapsed time.
+
+**Design note.** `Queue.Work` takes `func(ctx, T) error` via reflection, matching the design doc's API
+exactly, and validates the signature at registration (`TestHandlerSignatureIsCheckedAtRegistration`
+rejects seven wrong shapes). `T` may be any JSON-decodable type, `[]byte`/`json.RawMessage` for the raw
+payload, or `storage.Item` for the whole item.
