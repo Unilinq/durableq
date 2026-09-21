@@ -206,6 +206,134 @@ func TestFanOutSurvivesConnectionLoss(t *testing.T) {
 		up.Done, downstreamTotal, kills.Load())
 }
 
+// TestFanOutToMultipleSuccessorsSurvivesConnectionLoss is stage 10's extension
+// of the race gate: a job step fan-out, where one ack enqueues into several
+// distinct successor queues in the same transaction, under the same
+// connection-killing contention. Every branch must end up with exactly as
+// many items as the upstream acked - never an orphaned ack with a missing
+// branch, never a branch with more than its siblings.
+func TestFanOutToMultipleSuccessorsSurvivesConnectionLoss(t *testing.T) {
+	t.Parallel()
+	pool, _ := dedicatedDatabase(t, "fanoutbranches")
+
+	store, err := postgres.New(postgres.Config{Pool: pool, Schema: "public"})
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	ctx := context.Background()
+
+	branches := []string{"branch-a", "branch-b", "branch-c"}
+
+	const items = 150
+	for i := 0; i < items; i += 50 {
+		batch := make([]storage.NewItem, 0, 50)
+		for j := 0; j < 50; j++ {
+			batch = append(batch, storage.NewItem{Queue: "upstream-branches"})
+		}
+		if _, err := store.Enqueue(ctx, batch...); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var kills atomic.Int64
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(3 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+			n, err := store.TerminateOtherBackends(ctx)
+			if err == nil {
+				kills.Add(int64(n))
+			}
+		}
+	}()
+
+	for w := 0; w < 6; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			worker := fmt.Sprintf("fanb-%d", w)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				got, err := store.Claim(ctx, storage.ClaimOpts{
+					Queue: "upstream-branches", Worker: worker, Limit: 5, LeaseDuration: time.Minute,
+				})
+				if err != nil || len(got) == 0 {
+					continue
+				}
+				for _, it := range got {
+					produced := make([]storage.NewItem, len(branches))
+					for i, b := range branches {
+						produced[i] = storage.NewItem{Queue: b}
+					}
+					_, _ = store.Complete(ctx, storage.CompleteRequest{
+						ID: it.ID, Worker: worker, Produced: produced,
+					})
+				}
+			}
+		}(w)
+	}
+
+	deadline := time.After(30 * time.Second)
+	for {
+		done := false
+		select {
+		case <-deadline:
+			done = true
+		default:
+		}
+		up, err := statOf(ctx, store, "upstream-branches")
+		if err == nil && up.Done >= items {
+			done = true
+		}
+		if done {
+			break
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	if kills.Load() == 0 {
+		t.Fatalf("no connections were terminated; the test proved nothing")
+	}
+
+	up, err := statOf(ctx, store, "upstream-branches")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	var branchTotals []int
+	for _, b := range branches {
+		st, err := statOf(ctx, store, b)
+		if err != nil {
+			t.Fatalf("Stats %s: %v", b, err)
+		}
+		branchTotals = append(branchTotals, st.Ready+st.Running+st.Done+st.DLQ)
+	}
+	for i, total := range branchTotals {
+		if total != up.Done {
+			t.Fatalf("fan-out to multiple successors was torn by connection loss: "+
+				"%d upstream acked but %s has %d items (branch totals %v, %d connections killed)",
+				up.Done, branches[i], total, branchTotals, kills.Load())
+		}
+	}
+	t.Logf("acked %d upstream items with %v matching items across %d branches and %d killed connections",
+		up.Done, branchTotals, len(branches), kills.Load())
+}
+
 // TestWorkIsRecoveredAfterSIGKILL is the crash case for real: a separate
 // process claims work and is killed outright, leaving the lease held by
 // nothing. The reclaimer must return that work exactly once.
