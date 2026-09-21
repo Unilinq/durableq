@@ -311,6 +311,10 @@ type Lister interface {
 }
 
 // Execution is one invocation of a Job.
+//
+// State is a lifecycle marker, not a verdict. DurableQ has no completion
+// barrier: whether a run has finished is derived from the state of its items,
+// so callers asking "is this done?" project the run rather than read a column.
 type Execution struct {
 	ID        string
 	Job       string
@@ -320,9 +324,13 @@ type Execution struct {
 	UpdatedAt time.Time
 }
 
-// Execution states.
+// Execution lifecycle markers.
 const (
-	ExecutionRunning  = "running"
+	// ExecutionRunning is set when a run is created.
+	ExecutionRunning = "running"
+	// ExecutionComplete is available for callers that choose to mark a run
+	// finished on their own terms. Nothing in durableq sets it, because what
+	// counts as a finished run is a business question durableq does not answer.
 	ExecutionComplete = "complete"
 )
 

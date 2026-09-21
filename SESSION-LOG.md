@@ -295,3 +295,55 @@ pins this.
 **Lineage rule.** A step producing exactly one output passes its `item_id` on, so a lineage query follows
 one logical item end to end. A step producing several gives each child a new `item_id` with
 `parent_item_id` pointing back. `TestFanOutOfOneKeepsItemIdentity` pins both halves.
+
+### 2026-09-21T09:30Z — Stage 6 (projections and leak detection) — round 1 — **PASS**
+
+Branch `stage-6-projections`. 9 hand-counted fixtures + 4 end-to-end tests; stages 4a and 5 still green.
+
+| Criterion | Evidence | Verdict |
+| --- | --- | --- |
+| 1. Matches hand-counted fixtures | `internal/execution` — 9 pure-function tests: all-success, the design doc's §12 example verbatim (9983 successful / 17 DLQ), mid-flight, retries in flight, filtered, deleted rows, hand-off gap, duplication, capped output | PASS |
+| 2. Edge invariant `received == succeeded + filtered + dlq + active` | asserted per step in `TestProjectionFromDurableState` and enforced in `Project` as `LeakEdgeImbalance` | PASS |
+| 3. Edge continuity `produced == next.received + in flight` | `LeakContinuity` (settled upstream) and `LeakDuplication` (more arrived than produced); `TestProjectDetectsAHandOffGap`, `TestProjectDetectsDuplication` | PASS |
+| 4. Deleted in-flight row reported as a leak | `TestProjectionReportsDeletedWorkAsALeak` — healthy run first, then two rows deleted out from under it, leak reports exactly 2 missing | PASS |
+| 5. Capped discovery surfaces `produced_capped`/`dropped` | `TestProjectionSurfacesCappedDiscovery` — 200 emitted of 5000, counts balance perfectly, and the projection still reports 4800 dropped | PASS |
+| 6. Correct mid-flight, not only at rest | `TestProjectionIsCorrectMidFlight` — asserted while two handlers are blocked mid-step; a shortfall behind a working step is deliberately **not** a leak | PASS |
+| 7. No global discovered-to-indexed equality claimed | `Project` checks per-edge only; `Status` has just RUNNING and COMPLETE, with a comment saying why success is not durableq's verdict to give | PASS |
+| 8. `durableq run <exec_id>` renders the §14 table | transcript below | PASS |
+| 9. `-race -count=1` clean, stages 4a/5 green | all seven packages ok | PASS |
+
+Derived entirely by query: `StepCounts` is one SQL statement with `FILTER` clauses over `durableq_items`,
+so the answer is identical whichever process asks and survives any metrics retention window. No counter
+is kept in memory anywhere.
+
+Example run (`examples/pipeline`, 25 pages, every 7th fails permanently, every 3rd is filtered):
+```
+$ durableq run exec_b79042f5842b25bbea297b97
+Run exec_b79042f5842b25bbea297b97 (document-ingestion)
+Status: COMPLETE
+
+STEP      RECEIVED  SUCCESS  FILTERED  DLQ  ACTIVE  PRODUCED
+discover  1         1        0         0    0       25
+crawl     25        23       0         2    0       23
+process   23        20       3         0    0       20
+index     20        20       0         0    0       0
+
+Terminal successful: 20
+Terminal DLQ:        2
+Active:              0
+
+$ durableq trace exec_b79042f5842b25bbea297b97 item_f0f951b4f44e41bf3b2a6ceb
+STEP      RESULT         ATTEMPTS  ERROR
+discover  never entered  -         -
+crawl     dlq            2         http 451: unavailable for legal reasons
+process   never entered  -         -
+index     never entered  -         -
+```
+
+**One honesty fix during the stage.** The first `durableq runs` printed the stored `state` column, which
+said `running` for a run that had plainly finished. DurableQ has no completion barrier by design, so that
+column never changes; printing it was a stale answer dressed up as a status. The listing now derives
+status per row, and `storage.Execution.State` is documented as a lifecycle marker rather than a verdict.
+
+Also added `examples/pipeline` (the design doc's four-step job) and `DeleteItemForTest`, which exists only
+so a test can make work vanish and prove the projection notices.

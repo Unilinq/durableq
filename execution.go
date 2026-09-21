@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/unilinq/durableq/internal/execution"
 	"github.com/unilinq/durableq/storage"
 )
 
@@ -58,4 +59,38 @@ func (a *App) ExecutionSteps(ctx context.Context, executionID string) ([]storage
 		return nil, err
 	}
 	return es.ExecutionSteps(ctx, executionID)
+}
+
+// Projection is the run-level answer to "what happened to this run?".
+type Projection = execution.Projection
+
+// StepProjection is one row of the run table.
+type StepProjection = execution.StepProjection
+
+// Leak is one discrepancy found while projecting a run.
+type Leak = execution.Leak
+
+// Run-level status values.
+const (
+	StatusRunning  = execution.StatusRunning
+	StatusComplete = execution.StatusComplete
+)
+
+// Projection derives the state of one execution from durable state. Nothing is
+// cached: the answer is a query, so it is the same whichever process asks and
+// survives any metrics retention window.
+func (a *App) Projection(ctx context.Context, executionID string) (Projection, error) {
+	es, err := a.executionStore()
+	if err != nil {
+		return Projection{}, err
+	}
+	exec, err := es.GetExecution(ctx, executionID)
+	if err != nil {
+		return Projection{}, err
+	}
+	counts, err := es.StepCounts(ctx, executionID)
+	if err != nil {
+		return Projection{}, err
+	}
+	return execution.Project(exec, counts), nil
 }

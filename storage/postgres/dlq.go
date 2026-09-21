@@ -217,3 +217,12 @@ func (s *Store) TerminateOtherBackends(ctx context.Context) (int, error) {
 		) t`).Scan(&n)
 	return n, err
 }
+
+// DeleteItemForTest removes one item outright, bypassing every retention rule.
+// It exists so tests can simulate work disappearing for reasons outside
+// durableq's control and prove the projection reports it as a leak rather than
+// absorbing it. Nothing in the library calls it.
+func (s *Store) DeleteItemForTest(ctx context.Context, id int64) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM `+s.tbl("durableq_items")+` WHERE id = $1`, id)
+	return err
+}

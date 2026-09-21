@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/unilinq/durableq/internal/dlq"
+	"github.com/unilinq/durableq/internal/execution"
 	"github.com/unilinq/durableq/storage"
 	"github.com/unilinq/durableq/storage/postgres"
 )
@@ -35,6 +36,9 @@ Commands:
   dlq ls <queue.dlq>    list dead-lettered items
   dlq replay <queue.dlq>  return dead-lettered items to their working queue
   item <id>             show one item and its attempt history
+  runs                  list recent job executions
+  run <exec-id>         show a run: per-step counts and any leaks
+  trace <exec-id> <item-id>   follow one item through every step
   gc                    delete completed items past retention
   pause <queue>         stop workers claiming a queue
   resume <queue>        undo pause
@@ -87,6 +91,12 @@ func run() error {
 		return cmdDLQ(ctx, g, args[1:])
 	case "item":
 		return cmdItem(ctx, g, args[1:])
+	case "runs":
+		return cmdRuns(ctx, g, args[1:])
+	case "run":
+		return cmdRun(ctx, g, args[1:])
+	case "trace":
+		return cmdTrace(ctx, g, args[1:])
 	case "gc":
 		return cmdGC(ctx, g, args[1:])
 	case "pause":
@@ -305,6 +315,119 @@ func cmdItem(ctx context.Context, g globals, args []string) error {
 		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n",
 			a.Attempt, orDash(a.Worker), a.StartedAt.Format(time.RFC3339),
 			orDash(a.Outcome), truncate(a.Error, 50))
+	}
+	return w.Flush()
+}
+
+func cmdRuns(ctx context.Context, g globals, args []string) error {
+	fs := flag.NewFlagSet("runs", flag.ContinueOnError)
+	limit := fs.Int("limit", 20, "maximum executions to list")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	st, closeFn, err := g.store(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+
+	execs, err := st.ListExecutions(ctx, *limit)
+	if err != nil {
+		return err
+	}
+	if len(execs) == 0 {
+		fmt.Println("no executions")
+		return nil
+	}
+	// Status is derived from item state, not read from a column: durableq has
+	// no completion barrier, so an execution row never announces that it
+	// finished. Printing the stored value here would be a stale answer.
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "EXECUTION\tJOB\tSTATUS\tACTIVE\tDLQ\tSTARTED")
+	for _, e := range execs {
+		counts, err := st.StepCounts(ctx, e.ID)
+		if err != nil {
+			return err
+		}
+		p := execution.Project(e, counts)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\t%s\n",
+			e.ID, e.Job, p.Status, p.Active, p.TerminalDLQ, e.CreatedAt.Format(time.RFC3339))
+	}
+	return w.Flush()
+}
+
+func cmdRun(ctx context.Context, g globals, args []string) error {
+	if len(args) < 1 {
+		return errors.New("run needs an execution id")
+	}
+	st, closeFn, err := g.store(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+
+	exec, err := st.GetExecution(ctx, args[0])
+	if err != nil {
+		return err
+	}
+	counts, err := st.StepCounts(ctx, args[0])
+	if err != nil {
+		return err
+	}
+	p := execution.Project(exec, counts)
+
+	fmt.Printf("Run %s (%s)\nStatus: %s\n\n", p.Execution.ID, p.Execution.Job, p.Status)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "STEP\tRECEIVED\tSUCCESS\tFILTERED\tDLQ\tACTIVE\tPRODUCED")
+	for _, s := range p.Steps {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%d\n",
+			s.StepID, s.Received, s.Succeeded, s.Filtered, s.DLQ, s.Active, s.Produced)
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	fmt.Printf("\nTerminal successful: %d\nTerminal DLQ:        %d\nActive:              %d\n",
+		p.TerminalSuccess, p.TerminalDLQ, p.Active)
+
+	if p.HasLeaks() {
+		fmt.Println("\nUnaccounted for:")
+		for _, l := range p.Leaks {
+			fmt.Printf("  %s\n", l)
+		}
+	}
+	return nil
+}
+
+func cmdTrace(ctx context.Context, g globals, args []string) error {
+	if len(args) < 2 {
+		return errors.New("trace needs an execution id and an item id")
+	}
+	st, closeFn, err := g.store(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+
+	entries, err := st.Lineage(ctx, args[0], args[1])
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("no execution %s", args[0])
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "STEP\tRESULT\tATTEMPTS\tERROR")
+	for _, e := range entries {
+		if !e.Entered {
+			fmt.Fprintf(w, "%s\tnever entered\t-\t-\n", e.StepID)
+			continue
+		}
+		result := string(e.State)
+		if e.Outcome != "" {
+			result = string(e.Outcome)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", e.StepID, result, e.Attempt, truncate(orDash(e.Error), 50))
 	}
 	return w.Flush()
 }
