@@ -198,3 +198,22 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// TerminateOtherBackends kills every other connection to this database. It
+// exists so the conformance suite can prove that acking a step and enqueuing
+// its downstream work survive losing a connection mid-transaction: either both
+// happened or neither did.
+//
+// It is destructive by design and is only ever called against a test database.
+func (s *Store) TerminateOtherBackends(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*)::int FROM (
+			SELECT pg_terminate_backend(pid)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND state = 'active'
+		) t`).Scan(&n)
+	return n, err
+}

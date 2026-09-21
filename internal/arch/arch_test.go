@@ -26,8 +26,10 @@ var backendPackages = []string{
 func backendImportAllowed(pkg string) bool {
 	switch {
 	case pkg == modulePath+"/storage/postgres",
-		pkg == modulePath+"/storage/sqlite",
-		pkg == modulePath+"/internal/dqtest":
+		pkg == modulePath+"/storage/sqlite":
+		return true
+	case strings.HasPrefix(pkg, modulePath+"/internal/dqtest"):
+		// The test harness and its crash-test helper must name a backend.
 		return true
 	case strings.HasPrefix(pkg, modulePath+"/cmd/"),
 		strings.HasPrefix(pkg, modulePath+"/examples/"):

@@ -48,4 +48,5 @@ func Run(t *testing.T, h Harness) {
 	t.Run("Sweep", func(t *testing.T) { runSweep(t, h) })
 	t.Run("Contention", func(t *testing.T) { runContention(t, h) })
 	t.Run("DLQContention", func(t *testing.T) { runDLQContention(t, h) })
+	t.Run("RaceGate", func(t *testing.T) { runRaceGate(t, h) })
 }
