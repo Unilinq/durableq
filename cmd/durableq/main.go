@@ -319,6 +319,21 @@ func cmdItem(ctx context.Context, g globals, args []string) error {
 	return w.Flush()
 }
 
+// stepEdges builds the successor map Project needs from the execution's
+// recorded step shape. Edges are authoritative for topology, so this is the
+// only place the CLI needs to ask what a step's successors are.
+func stepEdges(ctx context.Context, st storage.ExecutionStore, execID string) (map[string][]string, error) {
+	steps, err := st.ExecutionSteps(ctx, execID)
+	if err != nil {
+		return nil, err
+	}
+	edges := make(map[string][]string, len(steps))
+	for _, s := range steps {
+		edges[s.StepID] = s.Next
+	}
+	return edges, nil
+}
+
 func cmdRuns(ctx context.Context, g globals, args []string) error {
 	fs := flag.NewFlagSet("runs", flag.ContinueOnError)
 	limit := fs.Int("limit", 20, "maximum executions to list")
@@ -349,7 +364,11 @@ func cmdRuns(ctx context.Context, g globals, args []string) error {
 		if err != nil {
 			return err
 		}
-		p := execution.Project(e, counts)
+		edges, err := stepEdges(ctx, st, e.ID)
+		if err != nil {
+			return err
+		}
+		p := execution.Project(e, counts, edges)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\t%s\n",
 			e.ID, e.Job, p.Status, p.Active, p.TerminalDLQ, e.CreatedAt.Format(time.RFC3339))
 	}
@@ -374,7 +393,11 @@ func cmdRun(ctx context.Context, g globals, args []string) error {
 	if err != nil {
 		return err
 	}
-	p := execution.Project(exec, counts)
+	edges, err := stepEdges(ctx, st, args[0])
+	if err != nil {
+		return err
+	}
+	p := execution.Project(exec, counts, edges)
 
 	fmt.Printf("Run %s (%s)\nStatus: %s\n\n", p.Execution.ID, p.Execution.Job, p.Status)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)

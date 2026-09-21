@@ -9,6 +9,7 @@ package execution
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/unilinq/durableq/storage"
 )
@@ -64,17 +65,33 @@ const (
 	// but the one case where a shrinking count is expected, so it is surfaced
 	// rather than left to look like clean arithmetic.
 	LeakCappedOutput LeakKind = "capped-output"
+	// LeakBranchDivergence means two successors of the same fan-out step
+	// received different counts. A step's output is broadcast identically and
+	// atomically to every successor, so siblings under the same step always
+	// receive the same count; any difference names the exact edge that lost
+	// (or gained) work, which the group-level continuity check alone cannot
+	// do once a step has more than one successor.
+	LeakBranchDivergence LeakKind = "branch-divergence"
 )
 
 // Leak is one discrepancy found while projecting a run.
 type Leak struct {
-	Kind    LeakKind
-	StepID  string
+	Kind LeakKind
+	// StepID is the from-step: the step whose output the leak was detected
+	// on.
+	StepID string
+	// Edge names the specific edge (or edge group) the leak was detected on,
+	// formatted "from->to" or "from->{to1,to2,...}" for a group-level check
+	// spanning every successor of StepID.
+	Edge    string
 	Missing int
 	Detail  string
 }
 
 func (l Leak) String() string {
+	if l.Edge != "" {
+		return fmt.Sprintf("%s on edge %s: %s", l.Kind, l.Edge, l.Detail)
+	}
 	return fmt.Sprintf("%s at step %q: %s", l.Kind, l.StepID, l.Detail)
 }
 
@@ -101,7 +118,13 @@ func (p Projection) HasLeaks() bool { return len(p.Leaks) > 0 }
 
 // Project turns per-step counts into a run-level projection and checks the
 // invariants that reveal work disappearing between stages.
-func Project(exec storage.Execution, counts []storage.StepCount) Projection {
+//
+// edges is the step graph: for each step id, the successor ids its output is
+// broadcast to. A step with no entry, or an empty one, is a leaf - a
+// terminal step of the pipeline. Edges are authoritative for topology; Idx on
+// each step is for stable display ordering only, and nothing here infers
+// shape from it.
+func Project(exec storage.Execution, counts []storage.StepCount, edges map[string][]string) Projection {
 	p := Projection{Execution: exec, Status: StatusComplete}
 
 	for _, c := range counts {
@@ -120,15 +143,20 @@ func Project(exec storage.Execution, counts []storage.StepCount) Projection {
 		})
 	}
 
-	for i, s := range p.Steps {
+	byStep := make(map[string]StepProjection, len(p.Steps))
+	for _, s := range p.Steps {
+		byStep[s.StepID] = s
+	}
+
+	for _, s := range p.Steps {
 		p.TerminalDLQ += s.DLQ
 		p.Active += s.Active
 		if s.Active > 0 {
 			p.Status = StatusRunning
 		}
-		// Only the final step's successes leave the pipeline; every other
+		// Terminal steps are the leaves: steps with no successors. Every other
 		// step's success becomes work further down.
-		if i == len(p.Steps)-1 {
+		if len(edges[s.StepID]) == 0 {
 			p.TerminalSuccess += s.Succeeded
 		}
 
@@ -156,28 +184,74 @@ func Project(exec storage.Execution, counts []storage.StepCount) Projection {
 		}
 	}
 
-	// Continuity: what one step produced is what the next one received.
-	for i := 0; i+1 < len(p.Steps); i++ {
-		up, down := p.Steps[i], p.Steps[i+1]
-		if down.Received > up.Produced {
+	// Continuity is per fan-out group: for a step with successors S, what it
+	// broadcasts goes to every successor identically and atomically (in the
+	// same transaction as the ack that produced it), so
+	// sum(received for s in S) == produced. That is exactly the old adjacent-
+	// step check when |S| == 1.
+	for _, up := range p.Steps {
+		succIDs := edges[up.StepID]
+		if len(succIDs) == 0 {
+			continue
+		}
+
+		// Branch divergence: siblings under the same step must always receive
+		// the same count, whatever the state of the run, because the
+		// broadcast to every successor happens together. Any difference
+		// names the exact edge that is short (or long) - the group-sum check
+		// below cannot do that once a step has more than one successor.
+		maxReceived := 0
+		for _, to := range succIDs {
+			if d := byStep[to].Received; d > maxReceived {
+				maxReceived = d
+			}
+		}
+		if len(succIDs) > 1 {
+			for _, to := range succIDs {
+				got := byStep[to].Received
+				if got != maxReceived {
+					p.Leaks = append(p.Leaks, Leak{
+						Kind:    LeakBranchDivergence,
+						StepID:  up.StepID,
+						Edge:    up.StepID + "->" + to,
+						Missing: maxReceived - got,
+						Detail: fmt.Sprintf(
+							"%q received %d but sibling branch(es) of %q received %d",
+							to, got, up.StepID, maxReceived),
+					})
+				}
+			}
+		}
+
+		received := 0
+		for _, to := range succIDs {
+			received += byStep[to].Received
+		}
+		edge := up.StepID + "->" + strings.Join(succIDs, ",")
+		if len(succIDs) > 1 {
+			edge = up.StepID + "->{" + strings.Join(succIDs, ",") + "}"
+		}
+		if received > up.Produced {
 			p.Leaks = append(p.Leaks, Leak{
 				Kind:    LeakDuplication,
-				StepID:  down.StepID,
-				Missing: up.Produced - down.Received,
-				Detail: fmt.Sprintf("received %d items but %q only produced %d",
-					down.Received, up.StepID, up.Produced),
+				StepID:  up.StepID,
+				Edge:    edge,
+				Missing: up.Produced - received,
+				Detail: fmt.Sprintf("successors of %q received %d items but it only produced %d",
+					up.StepID, received, up.Produced),
 			})
 			continue
 		}
 		// While the upstream step is still working, the shortfall is just work
 		// that has not been produced yet.
-		if up.Active == 0 && down.Received < up.Produced {
+		if up.Active == 0 && received < up.Produced {
 			p.Leaks = append(p.Leaks, Leak{
 				Kind:    LeakContinuity,
-				StepID:  down.StepID,
-				Missing: up.Produced - down.Received,
-				Detail: fmt.Sprintf("%q finished producing %d items but only %d reached %q",
-					up.StepID, up.Produced, down.Received, down.StepID),
+				StepID:  up.StepID,
+				Edge:    edge,
+				Missing: up.Produced - received,
+				Detail: fmt.Sprintf("%q finished producing %d items but only %d reached its successors",
+					up.StepID, up.Produced, received),
 			})
 		}
 	}

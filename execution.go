@@ -92,5 +92,13 @@ func (a *App) Projection(ctx context.Context, executionID string) (Projection, e
 	if err != nil {
 		return Projection{}, err
 	}
-	return execution.Project(exec, counts), nil
+	steps, err := es.ExecutionSteps(ctx, executionID)
+	if err != nil {
+		return Projection{}, err
+	}
+	edges := make(map[string][]string, len(steps))
+	for _, s := range steps {
+		edges[s.StepID] = s.Next
+	}
+	return execution.Project(exec, counts, edges), nil
 }
