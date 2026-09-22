@@ -157,8 +157,13 @@ type Item struct {
 	LastWorker string
 
 	// Lineage. Set when the item belongs to a Job execution.
-	ExecutionID  string
-	StepID       string
+	ExecutionID string
+	StepID      string
+	// ItemID identifies one logical item within an execution. It is unique
+	// per (execution_id, step_id), not globally: a single-payload broadcast
+	// at a fan-out step writes the same ItemID to every successor on purpose,
+	// so a lineage query follows one logical item into every branch it
+	// entered.
 	ItemID       string
 	ParentItemID string
 

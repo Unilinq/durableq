@@ -371,6 +371,83 @@ func TestProjectionOnAFanOut(t *testing.T) {
 	}
 }
 
+// TestProjectionBranchDivergenceNamesTheGainingBranch proves branch-divergence
+// attribution is exact in both directions: when one branch gains an extra
+// row, the leak must name that branch, not its healthy siblings which merely
+// look short by comparison to it.
+func TestProjectionBranchDivergenceNamesTheGainingBranch(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t)
+
+	const per = 4
+	job := app.Job("projected-fanout-gain").
+		Step("split", func(ctx context.Context, in struct{}) ([]crawlIn, error) {
+			out := make([]crawlIn, 0, per)
+			for i := 0; i < per; i++ {
+				out = append(out, crawlIn{URL: fmt.Sprint(i)})
+			}
+			return out, nil
+		}).
+		Step("document", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2)).
+		Step("metadata", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2)).
+		Step("acl", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2))
+
+	app.startJob(t, job)
+	exec, err := job.Run(t.Context(), struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	app.waitForExecution(t, exec.ID, 1+per*3)
+
+	before, err := app.Projection(t.Context(), exec.ID)
+	if err != nil {
+		t.Fatalf("Projection: %v", err)
+	}
+	if before.HasLeaks() {
+		t.Fatalf("a healthy fan-out reported leaks: %v", before.Leaks)
+	}
+
+	// Something outside durableq inserts an extra row into one branch only:
+	// document gains work, metadata and acl stay exactly as healthy as before.
+	if _, err := app.Store().Enqueue(t.Context(), storage.NewItem{
+		Queue:       StepQueue("projected-fanout-gain", "document"),
+		ExecutionID: exec.ID, StepID: "document", ItemID: "injected",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	after, err := app.Projection(t.Context(), exec.ID)
+	if err != nil {
+		t.Fatalf("Projection: %v", err)
+	}
+	if !after.HasLeaks() {
+		t.Fatalf("an extra row on one branch was not reported: %+v", after.Steps)
+	}
+	var divergence *Leak
+	for i := range after.Leaks {
+		if after.Leaks[i].Kind == execution.LeakBranchDivergence {
+			divergence = &after.Leaks[i]
+		}
+	}
+	if divergence == nil {
+		t.Fatalf("expected a branch-divergence leak naming the branch that gained work, got %v", after.Leaks)
+	}
+	if divergence.StepID != "split" || divergence.Edge != "split->document" {
+		t.Fatalf("leak names step %q edge %q, want split->document (the branch that gained a row)",
+			divergence.StepID, divergence.Edge)
+	}
+	if divergence.Missing != -1 {
+		t.Fatalf("leak reports %d missing, want -1 (one more than expected, not fewer)", divergence.Missing)
+	}
+	// The two branches that are merely healthy, compared to the one that
+	// gained work, must never themselves be named.
+	for _, l := range after.Leaks {
+		if l.Kind == execution.LeakBranchDivergence && l.Edge != "split->document" {
+			t.Fatalf("a healthy branch was blamed instead of the one that gained work: %+v", l)
+		}
+	}
+}
+
 // TestSlowBranchIsNotALeak is criterion 7: a branch that is only slower than
 // its siblings, with work still in flight, must never be reported as a leak.
 func TestSlowBranchIsNotALeak(t *testing.T) {

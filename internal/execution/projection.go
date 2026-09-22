@@ -195,31 +195,36 @@ func Project(exec storage.Execution, counts []storage.StepCount, edges map[strin
 			continue
 		}
 
-		// Branch divergence: siblings under the same step must always receive
-		// the same count, whatever the state of the run, because the
-		// broadcast to every successor happens together. Any difference
-		// names the exact edge that is short (or long) - the group-sum check
-		// below cannot do that once a step has more than one successor.
-		maxReceived := 0
-		for _, to := range succIDs {
-			if d := byStep[to].Received; d > maxReceived {
-				maxReceived = d
-			}
-		}
+		// Branch divergence: every successor of the same step must receive
+		// exactly up.Produced / len(succIDs), whatever the state of the run,
+		// because the broadcast to every successor happens together and
+		// identically - it is not merely that siblings should agree with each
+		// other (comparing against the largest sibling blames whichever
+		// branches are healthy when one branch gains an extra row, since
+		// every other branch then looks short by comparison). Comparing each
+		// branch against the exact expected count instead names the actual
+		// anomalous edge regardless of whether it lost or gained work.
 		if len(succIDs) > 1 {
+			expected := up.Produced / len(succIDs)
 			for _, to := range succIDs {
 				got := byStep[to].Received
-				if got != maxReceived {
-					p.Leaks = append(p.Leaks, Leak{
-						Kind:    LeakBranchDivergence,
-						StepID:  up.StepID,
-						Edge:    up.StepID + "->" + to,
-						Missing: maxReceived - got,
-						Detail: fmt.Sprintf(
-							"%q received %d but sibling branch(es) of %q received %d",
-							to, got, up.StepID, maxReceived),
-					})
+				if got == expected {
+					continue
 				}
+				diff := expected - got
+				direction := "fewer than"
+				if got > expected {
+					direction = "more than"
+				}
+				p.Leaks = append(p.Leaks, Leak{
+					Kind:    LeakBranchDivergence,
+					StepID:  up.StepID,
+					Edge:    up.StepID + "->" + to,
+					Missing: diff,
+					Detail: fmt.Sprintf(
+						"%q received %d but should have received %d (%s its siblings under %q)",
+						to, got, expected, direction, up.StepID),
+				})
 			}
 		}
 
