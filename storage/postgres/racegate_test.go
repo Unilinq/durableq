@@ -394,6 +394,14 @@ func TestWorkIsRecoveredAfterSIGKILL(t *testing.T) {
 	if len(claimed) != items {
 		t.Fatalf("crashworker claimed %d items, want %d", len(claimed), items)
 	}
+	// crashworker leases on the real wall clock, not the stub one below, so
+	// the reference point for "the lease has lapsed" has to be real time
+	// taken here - right after the claim is confirmed - not the stub clock's
+	// value frozen at test start. Building and starting the subprocess is not
+	// bounded in duration, especially under contention from the rest of this
+	// package's race-gate tests, so anchoring to a value from before that
+	// step is a race against however long it took.
+	claimedAt := time.Now()
 
 	// The process dies with the work still leased to it. No ack, no release,
 	// no chance to clean up.
@@ -416,7 +424,7 @@ func TestWorkIsRecoveredAfterSIGKILL(t *testing.T) {
 	}
 
 	// The lease lapses and the reclaimer returns the work — once.
-	clock.Advance(31 * time.Second)
+	clock.Set(claimedAt.Add(31 * time.Second))
 	res, err := store.ReclaimExpired(ctx, storage.ReclaimOpts{Limit: 100})
 	if err != nil {
 		t.Fatalf("ReclaimExpired: %v", err)
