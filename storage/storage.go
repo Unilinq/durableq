@@ -157,8 +157,13 @@ type Item struct {
 	LastWorker string
 
 	// Lineage. Set when the item belongs to a Job execution.
-	ExecutionID  string
-	StepID       string
+	ExecutionID string
+	StepID      string
+	// ItemID identifies one logical item within an execution. It is unique
+	// per (execution_id, step_id), not globally: a single-payload broadcast
+	// at a fan-out step writes the same ItemID to every successor on purpose,
+	// so a lineage query follows one logical item into every branch it
+	// entered.
 	ItemID       string
 	ParentItemID string
 
@@ -336,11 +341,16 @@ const (
 
 // StepDef records one step of a job for one execution, so lineage and
 // projections can be read back without the job definition being in memory.
+//
+// Next names this step's successors. A linear job has at most one; a step
+// with several is a fan-out, broadcasting its output to every successor as
+// its own item on that successor's queue. Edges are authoritative for
+// topology: Idx is for stable display ordering only.
 type StepDef struct {
-	StepID    string
-	Idx       int
-	Queue     string
-	NextQueue string
+	StepID string
+	Idx    int
+	Queue  string
+	Next   []string
 }
 
 // LineageEntry is what happened to one item at one step. A step the item never

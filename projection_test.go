@@ -225,7 +225,7 @@ func TestProjectionSurfacesCappedDiscovery(t *testing.T) {
 	}
 	if err := es.CreateExecution(ctx, storage.Execution{ID: execID, Job: "capped"},
 		[]storage.StepDef{
-			{StepID: "discover", Idx: 0, Queue: "capped.discover", NextQueue: "capped.crawl"},
+			{StepID: "discover", Idx: 0, Queue: "capped.discover", Next: []string{"crawl"}},
 			{StepID: "crawl", Idx: 1, Queue: "capped.crawl"},
 		}); err != nil {
 		t.Fatalf("CreateExecution: %v", err)
@@ -279,6 +279,226 @@ func TestProjectionSurfacesCappedDiscovery(t *testing.T) {
 	}
 	if capped.Missing != 4800 {
 		t.Fatalf("capped leak reports %d dropped, want 4800", capped.Missing)
+	}
+}
+
+// TestProjectionOnAFanOut is criterion 6: per-leaf terminal counts, per-group
+// continuity, the per-step invariant, and a deliberately deleted row reported
+// as a leak naming the right edge.
+func TestProjectionOnAFanOut(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t)
+
+	const per = 5
+	job := app.Job("projected-fanout").
+		Step("split", func(ctx context.Context, in struct{}) ([]crawlIn, error) {
+			out := make([]crawlIn, 0, per)
+			for i := 0; i < per; i++ {
+				out = append(out, crawlIn{URL: fmt.Sprint(i)})
+			}
+			return out, nil
+		}).
+		Step("b1", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2)).
+		Step("b2", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2)).
+		Step("b3", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2))
+
+	app.startJob(t, job)
+	exec, err := job.Run(t.Context(), struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	app.waitForExecution(t, exec.ID, 1+per*3)
+
+	before, err := app.Projection(t.Context(), exec.ID)
+	if err != nil {
+		t.Fatalf("Projection: %v", err)
+	}
+	if before.HasLeaks() {
+		t.Fatalf("a healthy fan-out reported leaks: %v", before.Leaks)
+	}
+	// Terminal steps are the leaves: b1, b2 and b3, not "the last step by idx".
+	if before.TerminalSuccess != per*3 {
+		t.Fatalf("terminal success: got %d, want %d (every leaf's successes)", before.TerminalSuccess, per*3)
+	}
+	byStep := map[string]StepProjection{}
+	for _, s := range before.Steps {
+		byStep[s.StepID] = s
+	}
+	for _, b := range []string{"b1", "b2", "b3"} {
+		if got := byStep[b]; got.Received != per || got.Succeeded != per {
+			t.Fatalf("%s: %+v, want %d received and succeeded", b, got, per)
+		}
+	}
+	for _, s := range before.Steps {
+		if s.Received != s.Succeeded+s.Filtered+s.DLQ+s.Active {
+			t.Fatalf("edge invariant broken at %s: %+v", s.StepID, s)
+		}
+	}
+
+	// Something outside durableq removes one row from one branch only.
+	deleted := deleteItems(t, app, exec.ID, "b2", 1)
+	if deleted != 1 {
+		t.Fatalf("deleted %d rows, want 1", deleted)
+	}
+
+	after, err := app.Projection(t.Context(), exec.ID)
+	if err != nil {
+		t.Fatalf("Projection: %v", err)
+	}
+	if !after.HasLeaks() {
+		t.Fatalf("a deleted row on one branch was not reported: %+v", after.Steps)
+	}
+	var divergence *Leak
+	for i := range after.Leaks {
+		if after.Leaks[i].Kind == execution.LeakBranchDivergence {
+			divergence = &after.Leaks[i]
+		}
+	}
+	if divergence == nil {
+		t.Fatalf("expected a branch-divergence leak naming the short branch, got %v", after.Leaks)
+	}
+	if divergence.StepID != "split" || divergence.Edge != "split->b2" {
+		t.Fatalf("leak names step %q edge %q, want split->b2", divergence.StepID, divergence.Edge)
+	}
+	if divergence.Missing != 1 {
+		t.Fatalf("leak reports %d missing, want 1 (%s)", divergence.Missing, divergence.Detail)
+	}
+	// A sibling that is merely faster than b2 must never itself be named.
+	for _, l := range after.Leaks {
+		if l.Kind == execution.LeakBranchDivergence && l.Edge != "split->b2" {
+			t.Fatalf("an unaffected branch was reported as leaking: %+v", l)
+		}
+	}
+}
+
+// TestProjectionBranchDivergenceNamesTheGainingBranch proves branch-divergence
+// attribution is exact in both directions: when one branch gains an extra
+// row, the leak must name that branch, not its healthy siblings which merely
+// look short by comparison to it.
+func TestProjectionBranchDivergenceNamesTheGainingBranch(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t)
+
+	const per = 4
+	job := app.Job("projected-fanout-gain").
+		Step("split", func(ctx context.Context, in struct{}) ([]crawlIn, error) {
+			out := make([]crawlIn, 0, per)
+			for i := 0; i < per; i++ {
+				out = append(out, crawlIn{URL: fmt.Sprint(i)})
+			}
+			return out, nil
+		}).
+		Step("document", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2)).
+		Step("metadata", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2)).
+		Step("acl", func(ctx context.Context, in crawlIn) error { return nil }, After("split"), StepConcurrency(2))
+
+	app.startJob(t, job)
+	exec, err := job.Run(t.Context(), struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	app.waitForExecution(t, exec.ID, 1+per*3)
+
+	before, err := app.Projection(t.Context(), exec.ID)
+	if err != nil {
+		t.Fatalf("Projection: %v", err)
+	}
+	if before.HasLeaks() {
+		t.Fatalf("a healthy fan-out reported leaks: %v", before.Leaks)
+	}
+
+	// Something outside durableq inserts an extra row into one branch only:
+	// document gains work, metadata and acl stay exactly as healthy as before.
+	if _, err := app.Store().Enqueue(t.Context(), storage.NewItem{
+		Queue:       StepQueue("projected-fanout-gain", "document"),
+		ExecutionID: exec.ID, StepID: "document", ItemID: "injected",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	after, err := app.Projection(t.Context(), exec.ID)
+	if err != nil {
+		t.Fatalf("Projection: %v", err)
+	}
+	if !after.HasLeaks() {
+		t.Fatalf("an extra row on one branch was not reported: %+v", after.Steps)
+	}
+	var divergence *Leak
+	for i := range after.Leaks {
+		if after.Leaks[i].Kind == execution.LeakBranchDivergence {
+			divergence = &after.Leaks[i]
+		}
+	}
+	if divergence == nil {
+		t.Fatalf("expected a branch-divergence leak naming the branch that gained work, got %v", after.Leaks)
+	}
+	if divergence.StepID != "split" || divergence.Edge != "split->document" {
+		t.Fatalf("leak names step %q edge %q, want split->document (the branch that gained a row)",
+			divergence.StepID, divergence.Edge)
+	}
+	if divergence.Missing != -1 {
+		t.Fatalf("leak reports %d missing, want -1 (one more than expected, not fewer)", divergence.Missing)
+	}
+	// The two branches that are merely healthy, compared to the one that
+	// gained work, must never themselves be named.
+	for _, l := range after.Leaks {
+		if l.Kind == execution.LeakBranchDivergence && l.Edge != "split->document" {
+			t.Fatalf("a healthy branch was blamed instead of the one that gained work: %+v", l)
+		}
+	}
+}
+
+// TestSlowBranchIsNotALeak is criterion 7: a branch that is only slower than
+// its siblings, with work still in flight, must never be reported as a leak.
+func TestSlowBranchIsNotALeak(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t)
+
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	job := app.Job("slow-branch").
+		Step("split", func(ctx context.Context, in struct{}) (crawlIn, error) {
+			return crawlIn{URL: "shared"}, nil
+		}).
+		Step("fast", func(ctx context.Context, in crawlIn) error { return nil }, After("split")).
+		Step("slow", func(ctx context.Context, in crawlIn) error {
+			entered <- struct{}{}
+			<-hold
+			return nil
+		}, After("split"))
+
+	pools := app.startJob(t, job)
+	t.Cleanup(func() { close(hold) })
+
+	exec, err := job.Run(t.Context(), struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	pools["split"].TestSignals.Acked.WaitOrTimeout(t)
+	pools["fast"].TestSignals.Acked.WaitOrTimeout(t)
+	<-entered
+
+	p, err := app.Projection(t.Context(), exec.ID)
+	if err != nil {
+		t.Fatalf("Projection: %v", err)
+	}
+	if p.Status != StatusRunning {
+		t.Fatalf("status: got %s, want RUNNING while the slow branch is in flight", p.Status)
+	}
+	byStep := map[string]StepProjection{}
+	for _, s := range p.Steps {
+		byStep[s.StepID] = s
+	}
+	if got := byStep["fast"]; got.Succeeded != 1 {
+		t.Fatalf("fast: %+v, want 1 succeeded", got)
+	}
+	if got := byStep["slow"]; got.Received != 1 || got.Active != 1 || got.Succeeded != 0 {
+		t.Fatalf("slow: %+v, want 1 received, still active, not yet succeeded", got)
+	}
+	if p.HasLeaks() {
+		t.Fatalf("a branch that is merely slower than its sibling was reported as a leak: %v", p.Leaks)
 	}
 }
 

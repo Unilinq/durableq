@@ -61,6 +61,140 @@ func TestMigrateUpDownUp(t *testing.T) {
 	}
 }
 
+// TestStepEdgesBackfillMatchesALinearJob proves migration 00002's backfill
+// produces exactly the edges a linear job's CreateExecution would write for
+// the same pipeline shape, by seeding pre-00002 data (a next_queue-ordered
+// chain) and letting the migration run.
+func TestStepEdgesBackfillMatchesALinearJob(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	schema := dqtest.Schema(t) // already fully migrated
+
+	conn, err := pgx.Connect(ctx, dqtest.DatabaseURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	// Roll back to just after 00001, where durableq_steps still has
+	// next_queue and durableq_step_edges does not exist yet.
+	if err := postgres.MigrateDown(ctx, conn, schema, 1); err != nil {
+		t.Fatalf("MigrateDown to 1: %v", err)
+	}
+
+	if err := withSchema(ctx, conn, schema, func() error {
+		if _, err := conn.Exec(ctx,
+			`INSERT INTO durableq_executions (id, job) VALUES ('exec_backfill', 'chain')`); err != nil {
+			return err
+		}
+		steps := []struct{ id, queue, next string }{
+			{"a", "chain.a", "chain.b"},
+			{"b", "chain.b", "chain.c"},
+			{"c", "chain.c", ""},
+		}
+		for i, s := range steps {
+			var next any
+			if s.next != "" {
+				next = s.next
+			}
+			if _, err := conn.Exec(ctx,
+				`INSERT INTO durableq_steps (execution_id, step_id, idx, queue, next_queue) VALUES ($1,$2,$3,$4,$5)`,
+				"exec_backfill", s.id, i, s.queue, next); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed pre-00002 data: %v", err)
+	}
+
+	// Reapplying 00002 backfills the edges from what we just seeded.
+	if err := postgres.MigrateUp(ctx, conn, schema); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+
+	got, err := queryEdges(ctx, conn, schema, "exec_backfill")
+	if err != nil {
+		t.Fatalf("queryEdges: %v", err)
+	}
+	want := []edge{{"a", "b"}, {"b", "c"}}
+	if !edgesEqual(got, want) {
+		t.Fatalf("backfilled edges: got %v, want %v", got, want)
+	}
+
+	// The same shape written directly through CreateExecution, post-00002,
+	// produces the identical edge set.
+	store, err := postgres.New(postgres.Config{Pool: dqtest.Pool(t), Schema: schema})
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if err := store.CreateExecution(ctx, storage.Execution{ID: "exec_direct", Job: "chain"},
+		[]storage.StepDef{
+			{StepID: "a", Idx: 0, Queue: "chain.a", Next: []string{"b"}},
+			{StepID: "b", Idx: 1, Queue: "chain.b", Next: []string{"c"}},
+			{StepID: "c", Idx: 2, Queue: "chain.c"},
+		}); err != nil {
+		t.Fatalf("CreateExecution: %v", err)
+	}
+	direct, err := queryEdges(ctx, conn, schema, "exec_direct")
+	if err != nil {
+		t.Fatalf("queryEdges: %v", err)
+	}
+	if !edgesEqual(direct, want) {
+		t.Fatalf("directly written edges: got %v, want %v", direct, want)
+	}
+	if !edgesEqual(got, direct) {
+		t.Fatalf("backfilled edges %v do not match what a linear job writes directly %v", got, direct)
+	}
+}
+
+type edge struct{ from, to string }
+
+func queryEdges(ctx context.Context, conn *pgx.Conn, schema, execID string) ([]edge, error) {
+	var out []edge
+	err := withSchema(ctx, conn, schema, func() error {
+		rows, err := conn.Query(ctx,
+			`SELECT from_step_id, to_step_id FROM durableq_step_edges WHERE execution_id = $1 ORDER BY from_step_id, to_step_id`,
+			execID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e edge
+			if err := rows.Scan(&e.from, &e.to); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+func edgesEqual(a, b []edge) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// withSchema runs fn with search_path set to schema for the duration of one
+// connection use, then restores it. Test-only convenience for issuing plain
+// (unqualified) SQL against an isolated schema.
+func withSchema(ctx context.Context, conn *pgx.Conn, schema string, fn func() error) error {
+	if _, err := conn.Exec(ctx, "SET search_path TO "+postgres.QuoteIdent(schema)); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.Exec(ctx, "SET search_path TO DEFAULT") }()
+	return fn()
+}
+
 // TestMigrateUpIsIdempotent proves a second up is a no-op, which is what an
 // operator re-running deploys relies on.
 func TestMigrateUpIsIdempotent(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -202,12 +203,13 @@ func TestJobCreatesOneQueuePerStep(t *testing.T) {
 		t.Fatalf("recorded %d steps, want 3", len(steps))
 	}
 	want := []storage.StepDef{
-		{StepID: "a", Idx: 0, Queue: "ingest.a", NextQueue: "ingest.b"},
-		{StepID: "b", Idx: 1, Queue: "ingest.b", NextQueue: "ingest.c"},
-		{StepID: "c", Idx: 2, Queue: "ingest.c", NextQueue: ""},
+		{StepID: "a", Idx: 0, Queue: "ingest.a", Next: []string{"b"}},
+		{StepID: "b", Idx: 1, Queue: "ingest.b", Next: []string{"c"}},
+		{StepID: "c", Idx: 2, Queue: "ingest.c", Next: nil},
 	}
 	for i, w := range want {
-		if steps[i] != w {
+		if steps[i].StepID != w.StepID || steps[i].Idx != w.Idx || steps[i].Queue != w.Queue ||
+			!slices.Equal(steps[i].Next, w.Next) {
 			t.Fatalf("step %d: got %+v, want %+v", i, steps[i], w)
 		}
 	}

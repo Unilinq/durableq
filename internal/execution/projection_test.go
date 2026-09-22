@@ -14,14 +14,28 @@ func counts(cs ...storage.StepCount) []storage.StepCount {
 	return cs
 }
 
+// linearEdges builds the successor map for a straight chain, in the order the
+// counts were given - the shape every test before fan-out assumed implicitly
+// via adjacent index. It exists so those tests can keep asserting the exact
+// same thing through the now-explicit edges parameter: |S| == 1 everywhere,
+// which is exactly the case Project must reduce to the old behaviour for.
+func linearEdges(cs []storage.StepCount) map[string][]string {
+	edges := make(map[string][]string, len(cs))
+	for i := 0; i+1 < len(cs); i++ {
+		edges[cs[i].StepID] = []string{cs[i+1].StepID}
+	}
+	return edges
+}
+
 // TestProjectAllSuccess is the clean case: everything flowed through.
 func TestProjectAllSuccess(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_1"}, counts(
+	cs1 := counts(
 		storage.StepCount{StepID: "discover", Received: 1, Succeeded: 1, Produced: 100},
 		storage.StepCount{StepID: "crawl", Received: 100, Succeeded: 100, Produced: 100},
 		storage.StepCount{StepID: "index", Received: 100, Succeeded: 100},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_1"}, cs1, linearEdges(cs1))
 
 	if p.Status != execution.StatusComplete {
 		t.Fatalf("status: got %s, want COMPLETE", p.Status)
@@ -41,11 +55,12 @@ func TestProjectAllSuccess(t *testing.T) {
 // TestProjectMatchesTheDesignDocumentExample reproduces section 12 exactly.
 func TestProjectMatchesTheDesignDocumentExample(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_123"}, counts(
+	cs123 := counts(
 		storage.StepCount{StepID: "crawl", Received: 10000, Succeeded: 9990, DLQ: 10, Produced: 9990},
 		storage.StepCount{StepID: "process", Received: 9990, Succeeded: 9985, DLQ: 5, Produced: 9985},
 		storage.StepCount{StepID: "index", Received: 9985, Succeeded: 9983, DLQ: 2},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_123"}, cs123, linearEdges(cs123))
 
 	if p.Status != execution.StatusComplete {
 		t.Fatalf("status: got %s, want COMPLETE", p.Status)
@@ -68,11 +83,12 @@ func TestProjectMatchesTheDesignDocumentExample(t *testing.T) {
 // only at rest, and that a shortfall behind a working step is not called a leak.
 func TestProjectWhileRunning(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_2"}, counts(
+	cs2 := counts(
 		storage.StepCount{StepID: "discover", Received: 1, Succeeded: 1, Produced: 50},
 		storage.StepCount{StepID: "crawl", Received: 50, Succeeded: 20, Active: 30, Produced: 20},
 		storage.StepCount{StepID: "index", Received: 18, Succeeded: 15, Active: 3},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_2"}, cs2, linearEdges(cs2))
 
 	if p.Status != execution.StatusRunning {
 		t.Fatalf("status: got %s, want RUNNING", p.Status)
@@ -92,11 +108,12 @@ func TestProjectWhileRunning(t *testing.T) {
 func TestProjectDetectsDeletedRows(t *testing.T) {
 	t.Parallel()
 	// 100 entered crawl, 90 accounted for. Ten rows vanished.
-	p := execution.Project(storage.Execution{ID: "exec_3"}, counts(
+	cs3 := counts(
 		storage.StepCount{StepID: "discover", Received: 1, Succeeded: 1, Produced: 100},
 		storage.StepCount{StepID: "crawl", Received: 100, Succeeded: 88, DLQ: 2, Produced: 88},
 		storage.StepCount{StepID: "index", Received: 88, Succeeded: 88},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_3"}, cs3, linearEdges(cs3))
 
 	if !p.HasLeaks() {
 		t.Fatalf("ten missing items were not reported")
@@ -118,10 +135,11 @@ func TestProjectDetectsDeletedRows(t *testing.T) {
 // TestProjectDetectsAHandOffGap covers work lost between two settled steps.
 func TestProjectDetectsAHandOffGap(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_4"}, counts(
+	cs4 := counts(
 		storage.StepCount{StepID: "crawl", Received: 10, Succeeded: 10, Produced: 10},
 		storage.StepCount{StepID: "index", Received: 7, Succeeded: 7},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_4"}, cs4, linearEdges(cs4))
 
 	var found *execution.Leak
 	for i := range p.Leaks {
@@ -141,10 +159,11 @@ func TestProjectDetectsAHandOffGap(t *testing.T) {
 // was produced.
 func TestProjectDetectsDuplication(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_5"}, counts(
+	cs5 := counts(
 		storage.StepCount{StepID: "crawl", Received: 10, Succeeded: 10, Produced: 10},
 		storage.StepCount{StepID: "index", Received: 13, Succeeded: 13},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_5"}, cs5, linearEdges(cs5))
 
 	var found bool
 	for _, l := range p.Leaks {
@@ -162,13 +181,14 @@ func TestProjectDetectsDuplication(t *testing.T) {
 // arithmetic.
 func TestProjectSurfacesCappedOutput(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_6"}, counts(
+	cs6 := counts(
 		storage.StepCount{
 			StepID: "discover", Received: 1, Succeeded: 1,
 			Produced: 200, Dropped: 4800, Capped: 1,
 		},
 		storage.StepCount{StepID: "crawl", Received: 200, Succeeded: 200},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_6"}, cs6, linearEdges(cs6))
 
 	// The counts themselves balance perfectly, which is exactly the danger.
 	var found *execution.Leak
@@ -189,10 +209,11 @@ func TestProjectSurfacesCappedOutput(t *testing.T) {
 // the edge rather than looking like loss.
 func TestProjectCountsFilteredAsAccountedFor(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_7"}, counts(
+	cs7 := counts(
 		storage.StepCount{StepID: "filter", Received: 10, Succeeded: 6, Filtered: 4, Produced: 6},
 		storage.StepCount{StepID: "sink", Received: 6, Succeeded: 6},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_7"}, cs7, linearEdges(cs7))
 	if p.HasLeaks() {
 		t.Fatalf("filtered items were treated as lost: %v", p.Leaks)
 	}
@@ -205,10 +226,11 @@ func TestProjectCountsFilteredAsAccountedFor(t *testing.T) {
 // lost or finished.
 func TestProjectWithRetriesInFlight(t *testing.T) {
 	t.Parallel()
-	p := execution.Project(storage.Execution{ID: "exec_8"}, counts(
+	cs8 := counts(
 		storage.StepCount{StepID: "flaky", Received: 20, Succeeded: 15, Active: 5, Produced: 15},
 		storage.StepCount{StepID: "sink", Received: 15, Succeeded: 15},
-	))
+	)
+	p := execution.Project(storage.Execution{ID: "exec_8"}, cs8, linearEdges(cs8))
 	if p.Status != execution.StatusRunning {
 		t.Fatalf("status: got %s, want RUNNING while retries are pending", p.Status)
 	}
