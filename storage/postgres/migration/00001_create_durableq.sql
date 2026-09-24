@@ -1,3 +1,6 @@
+-- Copyright 2026 Unilinq Inc
+-- SPDX-License-Identifier: Apache-2.0
+
 -- +goose Up
 -- Tables are created unqualified on purpose: the caller sets search_path to the
 -- target schema, so the same migration serves the default schema, a dedicated

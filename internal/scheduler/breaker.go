@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package scheduler runs durableq's background maintenance: returning work
 // whose lease lapsed, and deleting terminal work past its retention.
 package scheduler

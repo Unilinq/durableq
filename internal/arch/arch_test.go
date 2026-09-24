@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package arch_test enforces the structural rules the design depends on.
 // These are not style checks: each one prevents a class of defect that is
 // expensive to undo once code is built on top of it.

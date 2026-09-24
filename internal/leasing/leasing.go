@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package leasing keeps a worker's claim on the items it is still processing.
 //
 // A lease is the long-lived ownership mechanism: the database row says who

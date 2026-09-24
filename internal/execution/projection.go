@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package execution derives run-level state from the durable facts that
 // workers and queues leave behind.
 //

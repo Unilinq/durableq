@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package telemetry carries durableq's runtime events to whatever the
 // application wants to do with them, and samples the gauges that cannot be
 // derived from events alone.

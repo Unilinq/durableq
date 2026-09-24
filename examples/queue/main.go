@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Command queue is a runnable demonstration of durableq used as a plain queue:
 // enqueue work, process it with a handler, and let the policy deal with
 // failures. It seeds a schema you can then inspect with the durableq CLI.

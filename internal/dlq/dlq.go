@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package dlq drains dead-letter queues back into the work they came from.
 //
 // Replaying is deliberately a batched loop rather than one statement: draining

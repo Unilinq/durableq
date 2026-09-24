@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package durableq is a durable queue with multi-step job semantics on top of
 // an ordinary database.
 //

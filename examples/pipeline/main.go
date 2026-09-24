@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Command pipeline is a runnable demonstration of the design document's
 // example job: discover -> crawl -> process -> index, with a few pages that
 // fail permanently so the dead-letter queue and the run projection have
