@@ -152,7 +152,9 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           missing=0
-          for sha in $(git rev-list "${base}..${head}"); do
+          # Merge commits (e.g. from "Update branch") carry no new authorship;
+          # the DCO app skips them too.
+          for sha in $(git rev-list --no-merges "${base}..${head}"); do
             email=$(git show -s --format='%ae' "$sha")
             body=$(git show -s --format='%B' "$sha")
             if ! echo "$body" | grep -i "^Signed-off-by:" | grep -qiF "<${email}>"; then
