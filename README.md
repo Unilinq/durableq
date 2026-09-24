@@ -1,6 +1,11 @@
-# durableq
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+    <img alt="durableq" src="docs/assets/logo-light.png" width="420">
+  </picture>
+</p>
 
-A durable queue with multi-step job semantics, on an ordinary database.
+<p align="center">A durable queue with multi-step job semantics, on an ordinary database.</p>
 
 DurableQ sits between a plain work queue and a workflow engine. It gives you
 **item-level reliability** — at-least-once delivery, independent retries, worker
