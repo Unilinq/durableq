@@ -142,16 +142,18 @@ jobs:
       - name: Check that every commit is signed off
         run: |
           set -euo pipefail
+          # Dependabot cannot certify the DCO; the DCO app exempts bots too.
+          # Key on the PR opener, which a contributor cannot spoof, rather
+          # than the commit author email, which they can.
+          if [ "${{ github.event.pull_request.user.login }}" = "dependabot[bot]" ]; then
+            echo "Dependabot PR; DCO not required."
+            exit 0
+          fi
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           missing=0
           for sha in $(git rev-list "${base}..${head}"); do
             email=$(git show -s --format='%ae' "$sha")
-            # Dependabot cannot certify the DCO; the DCO app exempts bots
-            # too. Match its exact address so a spoofed email does not skip.
-            case "$email" in
-              "49699333+dependabot[bot]@users.noreply.github.com") continue ;;
-            esac
             body=$(git show -s --format='%B' "$sha")
             if ! echo "$body" | grep -i "^Signed-off-by:" | grep -qiF "<${email}>"; then
               echo "::error::commit $sha is not signed off by its author ($email)"
