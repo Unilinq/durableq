@@ -1,8 +1,5 @@
 # DurableQ: Data Plane Orchestrator
 
-Source: https://unilinq.atlassian.net/wiki/spaces/UE/pages/96174083/DurableQ+Data+Plane+Orchestrator
-
-
 ## Context and Scope
 Background processing systems generally provide one of two abstractions:
 
@@ -796,3 +793,14 @@ If upstream step bounds the output, DurableQ cant tell the difference.
 
 
 Example : Web Discovery step discovers 5000 pages, but say the config caps it at 200. Then the pipeline would show 200 done for all stages, while silently hiding the signal that 4800 pages were never crawled. 
+
+## Design decisions
+
+| Question | Decision |
+| --- | --- |
+| Downstream enqueue + upstream ack in one transaction? | Yes, always. `Store.Complete(ctx, itemID, worker, []NewItem)` is a single transaction in both adapters. Cross-store fan-out is out of scope for v0.1, so there is no case where one transaction cannot cover it. |
+| Attempt history retention | Every attempt writes a row to `durableq_attempts` (item_id, attempt, worker, started_at, ended_at, outcome, error). Compaction is a retention job, not a runtime concern: `durableq_attempts` rows are deletable independently of item state. Item keeps `attempt` and `last_error` denormalised so projections never join attempts. |
+| Queue retention / cleanup | Terminal items (`done`) are deleted by a sweeper after `retention` (default 7d); DLQ items are never auto-deleted. Sweeper is a library-level goroutine plus a `durableq gc` CLI verb, both driven by the same store method. |
+| Retry/DLQ policy owner | Queue owns the default policy; a step may override it. Effective policy = step override ?? queue default ?? package default (5 attempts, exponential 5s→30s→2m→10m, jitter). Policy is stored on the item at enqueue time so a policy change never rewrites in-flight work. |
+| Zero / one / many downstream items | Step handler signature returns the downstream payloads: `func(ctx, Item[T]) ([]U, error)`. Returning nil is a legitimate terminal success ("filtered"), recorded as `terminal_filtered`, distinct from success-with-output. A convenience `Step1` wrapper wraps single-output handlers. |
+| Projection meaning under fan-out | Per-edge counters only: each step records `received`, `succeeded`, `filtered`, `dlq`, `active`, `produced`. The leak invariant is per-edge (`received == succeeded + filtered + dlq + active`) and edge-continuity (`step[i].produced == step[i+1].received + in_flight`). No global discovered-to-indexed equality is claimed. §21's bounded-output limitation is handled by letting a step report `produced_capped = true` with `dropped` count, which surfaces in the projection instead of silently vanishing. |

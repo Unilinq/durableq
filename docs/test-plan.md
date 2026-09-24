@@ -83,7 +83,7 @@ Unique-job/dedup keys (`dbunique`), leader election (`leadership/elector_test.go
 
 `elector_test.go` and `notifier_test.go` are the two to come back to: the first the moment more than one process runs the sweeper, the second when polling latency becomes the complaint.
 
-## 4. Changes this survey suggests to `docs/plan.md`
+## 4. Changes this survey suggested to the implementation plan
 1. **Stage 1 must include the test harness** (schema isolation + injectable clock + test signals), not stage 3. River's whole suite depends on those three being present from the first commit.
 2. **Add queue pause/resume to v0.1** — cheap, and the standard operational response to a sick downstream.
 3. **Add a payload-decode-failure path** to the retry model: undecodable payload must DLQ at max attempts rather than retry forever.

@@ -11,16 +11,15 @@ import (
 	"github.com/unilinq/durableq/storage"
 )
 
-// TestJobFanOutDeliversToAllBranches is the design example from the stage 10
-// brief: one step with three successors, each getting its own copy of every
-// payload. k payloads at a step with n successors produce k*n downstream
-// items.
+// TestJobFanOutDeliversToAllBranches is the design example: one step with
+// three successors, each getting its own copy of every payload. k payloads
+// at a step with n successors produce k*n downstream items.
 func TestJobFanOutDeliversToAllBranches(t *testing.T) {
 	t.Parallel()
 	app := newTestApp(t)
 
 	const pages = 4
-	job := app.Job("sharepoint-ingest").
+	job := app.Job("document-ingest").
 		Step("discover", func(ctx context.Context, in discoverIn) ([]crawlIn, error) {
 			out := make([]crawlIn, 0, pages)
 			for i := 0; i < pages; i++ {
