@@ -33,10 +33,40 @@ than a re-derivation of the semantics.
 Processing is **at-least-once**. A handler may see the same item twice, so its
 side effects must tolerate that. DurableQ does not claim exactly-once.
 
+## Guarantees
+
+- **Delivery**: at-least-once. A crash between a handler finishing and the ack
+  landing means the item is redelivered; handlers must be safe to run twice.
+- **Claim**: `SELECT ... FOR UPDATE SKIP LOCKED` plus a state/lease update in
+  one transaction, so concurrent claimers never see the same row and never
+  block on each other.
+- **Leasing**: a claimed item is owned for `LeaseDuration`, renewed by a
+  heartbeat. A lease that is not renewed (crashed worker, lost heartbeat)
+  expires and the item is reclaimed and redelivered — see Shutdown below for
+  the one case where an item is returned without counting against its retry
+  budget.
+- **Retry**: exhausting a policy's attempts moves an item to its queue's DLQ
+  rather than retrying forever. See Configuration below for the default
+  policy and how it is resolved per queue or step.
+- **DLQ**: every queue has its own dead-letter queue, never auto-swept.
+  Replay puts an item back to `ready` without altering its attempt history.
+- **Concurrency**: each queue and job step enforces its own worker cap; a
+  slow or stuck handler holds one slot, not the whole pool.
+- **Transactions**: acking a step and enqueuing the items it produced happen
+  in one database transaction — a step is never marked done without its
+  downstream work existing, and never creates that work twice.
+
 ## Install
 
 ```bash
-go get github.com/unilinq/durableq
+go get github.com/unilinq/durableq@latest
+```
+
+```go
+import (
+    "github.com/unilinq/durableq"
+    "github.com/unilinq/durableq/storage/postgres"
+)
 ```
 
 ## Migrations
@@ -60,6 +90,30 @@ err := postgres.MigrateUp(ctx, conn, "durableq")
 
 Every statement durableq issues is schema-qualified, so the tables can live in
 their own schema alongside your application's.
+
+## PostgreSQL requirements
+
+- **Version**: tested on PostgreSQL 16. The claim path relies on `SELECT ...
+  FOR UPDATE SKIP LOCKED`, available since 9.5, so older supported versions
+  should work but are untested.
+- **Extensions**: none. Payloads and policies are stored as `jsonb`, which is
+  built in.
+- **Locks**: no advisory locks. Concurrency control is row-level, via
+  `FOR UPDATE SKIP LOCKED` inside ordinary transactions.
+- **Isolation**: the default `READ COMMITTED`. Nothing in the store raises
+  the isolation level or depends on serializable behaviour.
+- **Schema ownership**: all durableq tables live in one schema, set with
+  `-schema` (CLI) or `Config.Schema` (library) and defaulting to `public`.
+  Every statement is schema-qualified so this can be a schema you don't
+  otherwise own.
+- **Migrations**: applied as an explicit deploy step (`durableq migrate up`
+  or `postgres.MigrateUp`), never automatically on startup.
+- **Connection pooling**: the store takes a caller-provided `*pgxpool.Pool`;
+  it does not open its own connections. Whether that pool can safely sit
+  behind PgBouncer in transaction-pooling mode is untested — durableq's own
+  queries are self-contained within a single transaction, which is the
+  friendlier case for transaction pooling, but this has not been verified
+  against PgBouncer.
 
 ## A queue on its own
 
@@ -210,49 +264,6 @@ and hands back anything still running **without consuming an attempt**. Work
 interrupted by a deploy does not count against its retry budget. A handler that
 finished successfully during shutdown is acked rather than thrown away.
 
-## Using it from another repository
-
-DurableQ is a normal Go module. Until it is published, point at the local
-checkout with a workspace.
-
-From the consuming repository, for example `~/code/marketing-resolver`:
-
-```bash
-cd ~/code/marketing-resolver
-go work use ~/code/durableq
-go get github.com/unilinq/durableq
-```
-
-That adds `~/code/durableq` to `go.work`:
-
-```
-go 1.26.0
-
-use (
-	.
-	./obs
-	./sync
-	../durableq
-)
-```
-
-Then in code:
-
-```go
-import (
-    "github.com/unilinq/durableq"
-    "github.com/unilinq/durableq/storage/postgres"
-)
-```
-
-If you would rather not use a workspace, a `replace` directive in `go.mod` does
-the same job:
-
-```
-require github.com/unilinq/durableq v0.0.0
-replace github.com/unilinq/durableq => ../durableq
-```
-
 ## Examples
 
 ```bash
@@ -326,3 +337,33 @@ DURABLEQ_RACE_SOAK=1 go test ./... -race   # the 60s sustained-load soak
 Tests give themselves an isolated schema, so the whole suite runs in parallel
 against one database with no truncation between runs. Nothing sleeps to
 synchronise: tests wait on signals or advance an injected clock.
+
+The test scenario list and structure draw on
+[riverqueue/river](https://github.com/riverqueue/river)'s suite; see
+`docs/test-plan.md` for the survey and what was and wasn't borrowed. No River
+source is copied into this repo.
+
+## Project status
+
+DurableQ is v0.x, pre-1.0. PostgreSQL is the only supported backend. The
+exported API may still change between minor versions; see CONTRIBUTING.md.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions require a DCO
+sign-off (`git commit -s`).
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## Project origin
+
+DurableQ was designed and built at [Unilinq Inc](https://unilinq.ai/) to run
+the ingestion pipelines behind its data plane, and open-sourced in 2026 under
+the Apache License 2.0. Initial design and implementation: Chitresh
+Deshpande.
