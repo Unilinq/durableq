@@ -576,7 +576,8 @@ func TestRawAndItemHandlers(t *testing.T) {
 // TestStartStopStress catches shutdown races and leaked goroutines across many
 // start/stop cycles.
 func TestStartStopStress(t *testing.T) {
-	t.Parallel()
+	// Not parallel: it counts every goroutine in the process, so tests running
+	// alongside it would move the count and fail it spuriously.
 
 	baseline := 0
 	for cycle := 0; cycle < 8; cycle++ {
