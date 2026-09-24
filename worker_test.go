@@ -455,7 +455,7 @@ func TestHeartbeatKeepsALongHandlersLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	q.Pool().TestSignals.Started.WaitOrTimeout(t)
+	q.workerPool().TestSignals.Started.WaitOrTimeout(t)
 
 	first, err := app.Store().GetItem(t.Context(), item.ID)
 	if err != nil {
@@ -488,7 +488,7 @@ func TestHeartbeatKeepsALongHandlersLease(t *testing.T) {
 	}
 
 	// And the reclaimer leaves it alone, because the lease is still live.
-	res := app.Reclaimer().Pass(t.Context())
+	res := app.lazyReclaimer().Pass(t.Context())
 	if res.Reclaimed != 0 {
 		t.Fatalf("reclaimer took %d items whose lease was heartbeated", res.Reclaimed)
 	}

@@ -73,6 +73,21 @@ type StepProjection = execution.StepProjection
 // Leak is one discrepancy found while projecting a run.
 type Leak = execution.Leak
 
+// LeakKind names the invariant a Leak broke.
+type LeakKind = execution.LeakKind
+
+// Leak kinds.
+const (
+	LeakEdgeImbalance    = execution.LeakEdgeImbalance
+	LeakContinuity       = execution.LeakContinuity
+	LeakDuplication      = execution.LeakDuplication
+	LeakCappedOutput     = execution.LeakCappedOutput
+	LeakBranchDivergence = execution.LeakBranchDivergence
+)
+
+// Status is the run-level state of an execution.
+type Status = execution.Status
+
 // Run-level status values.
 const (
 	StatusRunning  = execution.StatusRunning

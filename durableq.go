@@ -243,7 +243,7 @@ func (a *App) Start(ctx context.Context) error {
 		_ = a.reclaimer.Run(runCtx)
 	}()
 
-	a.sweeper = a.Sweeper()
+	a.sweeper = a.lazySweeper()
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
@@ -303,9 +303,9 @@ func (a *App) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Reclaimer exposes the background lease recovery, so an operator tool can run
+// lazyReclaimer builds the lease-recovery loop on first use, so tests can run
 // one pass without starting the app.
-func (a *App) Reclaimer() *scheduler.Reclaimer {
+func (a *App) lazyReclaimer() *scheduler.Reclaimer {
 	if a.reclaimer == nil {
 		a.reclaimer = scheduler.NewReclaimer(scheduler.ReclaimerConfig{
 			Store:     a.cfg.Store,
@@ -319,9 +319,9 @@ func (a *App) Reclaimer() *scheduler.Reclaimer {
 	return a.reclaimer
 }
 
-// Sweeper exposes retention sweeping, so an operator tool can run one pass
-// without starting the app.
-func (a *App) Sweeper() *scheduler.Sweeper {
+// lazySweeper builds the retention sweeper on first use, so tests can run one
+// pass without starting the app.
+func (a *App) lazySweeper() *scheduler.Sweeper {
 	if a.sweeper == nil {
 		a.sweeper = scheduler.NewSweeper(scheduler.SweeperConfig{
 			Store:     a.cfg.Store,

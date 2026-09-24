@@ -231,9 +231,9 @@ func ReplayErrorContains(s string) ReplayOption {
 	return func(o *storage.ReplayOpts) { o.ErrorContains = s }
 }
 
-// Pool exposes the worker pool, for tests and for operators inspecting
-// in-flight work. It is nil until the app has started.
-func (q *Queue) Pool() *runtime.Pool {
+// workerPool returns the worker pool so tests can wait on its signals. It is
+// nil until the app has started.
+func (q *Queue) workerPool() *runtime.Pool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.pool
