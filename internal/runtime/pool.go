@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package runtime holds the worker loop: claiming work, dispatching it to
 // handlers, and turning each handler outcome into exactly one durable state
 // transition.

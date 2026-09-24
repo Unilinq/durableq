@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Command crashworker claims items and then hangs, so a test can SIGKILL it
 // and prove that work held by a process that vanished is recovered exactly
 // once by the reclaimer.

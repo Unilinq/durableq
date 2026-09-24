@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package storage defines the durable store contract shared by all adapters.
 //
 // DurableQ guarantees at-least-once processing. A handler may observe the same

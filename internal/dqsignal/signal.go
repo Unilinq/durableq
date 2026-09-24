@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package dqsignal provides a test signal: a channel wrapper that production
 // code can emit into at near-zero cost and that tests wait on, so concurrent
 // behaviour is asserted at the moment it happens instead of slept through.

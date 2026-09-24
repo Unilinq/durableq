@@ -1,5 +1,8 @@
+-- Copyright 2026 Unilinq Inc
+-- SPDX-License-Identifier: Apache-2.0
+
 -- +goose Up
--- Fan-out in Jobs (UENG-621): a step may name several successors, so topology
+-- Fan-out in Jobs: a step may name several successors, so topology
 -- is recorded as edges rather than a single next_queue column. Edges are
 -- authoritative for topology; durableq_steps.idx remains but is display
 -- ordering only from here on.

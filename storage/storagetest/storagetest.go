@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package storagetest is the conformance suite every durableq storage adapter
 // must pass. An adapter is finished when Run is green against it.
 //

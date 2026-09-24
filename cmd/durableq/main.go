@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Command durableq inspects and operates a durableq installation: migrations,
 // queue state, dead-letter listing and replay, retention, and pausing.
 package main

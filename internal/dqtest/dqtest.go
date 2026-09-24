@@ -1,3 +1,6 @@
+// Copyright 2026 Unilinq Inc
+// SPDX-License-Identifier: Apache-2.0
+
 // Package dqtest provides test isolation for durableq: one PostgreSQL schema
 // per test, an injectable clock, and pool plumbing. Tests never share rows and
 // never truncate between runs, so the whole suite runs in parallel.

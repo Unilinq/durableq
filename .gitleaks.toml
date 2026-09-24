@@ -1,0 +1,12 @@
+title = "durableq gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives"
+regexes = [
+  # generic-api-key matches slash-separated prose words as a "key" with
+  # high enough entropy; not a secret.
+  '''delivery/leasing/retry''',
+]
