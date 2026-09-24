@@ -7,5 +7,6 @@
 - [ ] `gofmt -l .` and `go vet ./...` are clean
 - [ ] Commits are signed off (`git commit -s`) per the DCO
 - [ ] If this changes storage semantics, `storage/storagetest` was extended
-- [ ] If this is design-affecting (new public API, delivery/leasing/retry
-      semantics), an issue was opened first and is linked here
+- [ ] If this is design-affecting (new public API, or a change to delivery,
+      leasing, or retry semantics), an issue was opened first and is linked
+      here
