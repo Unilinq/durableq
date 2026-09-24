@@ -343,11 +343,6 @@ Tests give themselves an isolated schema, so the whole suite runs in parallel
 against one database with no truncation between runs. Nothing sleeps to
 synchronise: tests wait on signals or advance an injected clock.
 
-The test scenario list and structure draw on
-[riverqueue/river](https://github.com/riverqueue/river)'s suite; see
-`docs/test-plan.md` for the survey and what was and wasn't borrowed. No River
-source is copied into this repo.
-
 ## Project status
 
 DurableQ is v0.x, pre-1.0. PostgreSQL is the only supported backend. The

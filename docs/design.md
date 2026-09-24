@@ -1,10 +1,10 @@
-# DurableQ: Data Plane Orchestrator
+# DurableQ design
 
 ## Context and Scope
 Background processing systems generally provide one of two abstractions:
 
 
-Queues such as River, BullMQ, Faktory, etc., which provide durable item processing, retries, and worker concurrency.
+Job queues, which provide durable item processing, retries, and worker concurrency.
 
 Workflow systems such as Temporal, which provide execution-level state and orchestration but introduce a substantially larger runtime model.
 A common data-processing workload sits between these abstractions.
@@ -638,29 +638,6 @@ The public API remains small while internal implementation can evolve without br
 
 # 17. Alternatives Considered
 
-## Use River directly
-River already provides a strong PostgreSQL-backed queue with:
-```
-retries
-worker concurrency
-scheduled jobs
-SKIP LOCKED claiming
-```
-
-However, DurableQ's desired abstraction additionally treats:
-```
-Job
-Execution
-Step
-Lineage
-Run-level projection
-Per-edge DLQ
-```
-
-as core concepts.
-Building these semantics entirely above River would couple DurableQ to PostgreSQL and River's internal execution model, making SQLite or other storage implementations significantly harder.
-Decision: implement queue semantics behind DurableQ's own storage contract.
-
 ## Temporal
 Temporal provides durable workflows, retries, timers, and rich execution histories.
 However, the primary workload here has very high item cardinality and relatively static pipeline topology:
@@ -746,61 +723,21 @@ Observability is a design requirement, not an afterthought.
 Core runtime code must never import PostgreSQL or SQLite implementations directly.
 Backend-specific behavior lives solely in storage adapters.
 
-# 19. Initial Implementation Plan
-The smallest useful implementation is:
-```
-1. Queue schema + storage contract
-2. PostgreSQL implementation
-3. Polling worker
-4. Atomic Claim()
-5. Ack
-6. Timed retry
-7. Lease expiry/recovery
-8. Per-queue DLQ
-9. DLQ replay
-10. Job/Execution lineage
-11. Multi-step Job transitions
-12. Execution projections
-13. Metrics hooks
-14. SQLite adapter
-15. CLI / visualization
-```
-
-The queue implementation should be independently usable before the Job abstraction is complete.
-
-# 20. Open Design Questions
-The major architecture is reasonably well defined. Remaining questions are implementation-level trade-offs rather than fundamental product gaps:
+# 19. Known Limitations
 
 
-Should downstream enqueue and upstream ack always require the same database transaction?
-
-What history of individual attempts should be retained versus compacted?
-
-How should queue retention/cleanup work?
-
-Should retry/DLQ policy belong to the queue, step, or allow both?
-
-How should an item intentionally produce zero, one, or multiple downstream items?
-
-What should the execution projection mean for pipelines where one item legitimately fans out into many?
-Those are the areas I would settle before calling this design v0.1 approved.
-The structure follows the design-doc pattern in the article: succinct objective context, explicit goals/non-goals, the actual design and its trade-offs, alternatives considered, and cross-cutting concerns. (Industrial Empathy)
-
-# 21. Known Limitations
+If an upstream step bounds its own output, DurableQ cannot tell unless the step reports it.
 
 
-If upstream step bounds the output, DurableQ cant tell the difference.
-
-
-Example : Web Discovery step discovers 5000 pages, but say the config caps it at 200. Then the pipeline would show 200 done for all stages, while silently hiding the signal that 4800 pages were never crawled. 
+Example: a discovery step finds 5000 pages but its config caps output at 200. Every stage then shows 200 done, and the 4800 pages that were never crawled are invisible. A step can report the cap (`produced_capped`, `dropped`) so the projection surfaces it; see the design decisions below.
 
 ## Design decisions
 
 | Question | Decision |
 | --- | --- |
-| Downstream enqueue + upstream ack in one transaction? | Yes, always. `Store.Complete(ctx, itemID, worker, []NewItem)` is a single transaction in both adapters. Cross-store fan-out is out of scope for v0.1, so there is no case where one transaction cannot cover it. |
+| Downstream enqueue + upstream ack in one transaction? | Yes, always. `Store.Complete(ctx, itemID, worker, []NewItem)` is a single transaction. Cross-store fan-out is out of scope for v0.1, so there is no case where one transaction cannot cover it. |
 | Attempt history retention | Every attempt writes a row to `durableq_attempts` (item_id, attempt, worker, started_at, ended_at, outcome, error). Compaction is a retention job, not a runtime concern: `durableq_attempts` rows are deletable independently of item state. Item keeps `attempt` and `last_error` denormalised so projections never join attempts. |
 | Queue retention / cleanup | Terminal items (`done`) are deleted by a sweeper after `retention` (default 7d); DLQ items are never auto-deleted. Sweeper is a library-level goroutine plus a `durableq gc` CLI verb, both driven by the same store method. |
 | Retry/DLQ policy owner | Queue owns the default policy; a step may override it. Effective policy = step override ?? queue default ?? package default (5 attempts, exponential 5s→30s→2m→10m, jitter). Policy is stored on the item at enqueue time so a policy change never rewrites in-flight work. |
-| Zero / one / many downstream items | Step handler signature returns the downstream payloads: `func(ctx, Item[T]) ([]U, error)`. Returning nil is a legitimate terminal success ("filtered"), recorded as `terminal_filtered`, distinct from success-with-output. A convenience `Step1` wrapper wraps single-output handlers. |
-| Projection meaning under fan-out | Per-edge counters only: each step records `received`, `succeeded`, `filtered`, `dlq`, `active`, `produced`. The leak invariant is per-edge (`received == succeeded + filtered + dlq + active`) and edge-continuity (`step[i].produced == step[i+1].received + in_flight`). No global discovered-to-indexed equality is claimed. §21's bounded-output limitation is handled by letting a step report `produced_capped = true` with `dropped` count, which surfaces in the projection instead of silently vanishing. |
+| Zero / one / many downstream items | A step handler returns its downstream payloads: `func(ctx, T) ([]U, error)`, with `func(ctx, T) (U, error)` for exactly one and `func(ctx, T) error` for a terminal step. Returning nil is a legitimate terminal success ("filtered"), recorded as `terminal_filtered`, distinct from success-with-output. |
+| Projection meaning under fan-out | Per-edge counters only: each step records `received`, `succeeded`, `filtered`, `dlq`, `active`, `produced`. The leak invariant is per-edge (`received == succeeded + filtered + dlq + active`) and edge-continuity (`step[i].produced == step[i+1].received + in_flight`). No global discovered-to-indexed equality is claimed. The bounded-output limitation in §19 is handled by letting a step report `produced_capped = true` with `dropped` count, which surfaces in the projection instead of silently vanishing. |
