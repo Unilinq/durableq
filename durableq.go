@@ -79,6 +79,13 @@ type Config struct {
 	// DefaultPolicy applies to queues that do not set their own.
 	DefaultPolicy storage.Policy
 
+	// FlushSize is how many buffered items make a streaming step commit its
+	// output to the next queues. Default 500. StepFlush overrides it per step.
+	FlushSize int
+	// FlushInterval is how long a streaming step may go without committing
+	// its buffered output; the check runs inside Out.Add. Default 1s.
+	FlushInterval time.Duration
+
 	Clock  storage.Clock
 	Logger *slog.Logger
 
@@ -127,6 +134,12 @@ func (c *Config) withDefaults() {
 	}
 	if c.DefaultPolicy.MaxAttempts == 0 && len(c.DefaultPolicy.Schedule) == 0 {
 		c.DefaultPolicy = storage.DefaultPolicy()
+	}
+	if c.FlushSize <= 0 {
+		c.FlushSize = 500
+	}
+	if c.FlushInterval <= 0 {
+		c.FlushInterval = time.Second
 	}
 	if c.Clock == nil {
 		c.Clock = storage.RealClock()

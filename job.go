@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/unilinq/durableq/internal/runtime"
 	"github.com/unilinq/durableq/storage"
@@ -45,6 +46,11 @@ type Step struct {
 	concurrency int
 	policy      storage.Policy
 
+	// flushSize and flushInterval override the Config for a streaming step.
+	// Zero means use the Config.
+	flushSize     int
+	flushInterval time.Duration
+
 	// afterSet is true once After has been called, even with no arguments.
 	// That distinguishes "no After was given, use the declaration-order
 	// default" from "explicitly given no predecessor".
@@ -60,6 +66,16 @@ func StepConcurrency(n int) StepOption { return func(s *Step) { s.concurrency = 
 
 // StepPolicy overrides the retry policy for work on this step's queue.
 func StepPolicy(p Policy) StepOption { return func(s *Step) { s.policy = p } }
+
+// StepFlush overrides the flush config of a streaming step: the buffer is
+// committed when it holds size items, or when interval has passed since the
+// last flush. A zero value keeps the Config setting.
+func StepFlush(size int, interval time.Duration) StepOption {
+	return func(s *Step) {
+		s.flushSize = size
+		s.flushInterval = interval
+	}
+}
 
 // After names this step's predecessor. A step with no After keeps today's
 // behaviour: its predecessor is the step declared before it (the first step
@@ -120,6 +136,11 @@ func (j *Job) Step(id string, handler any, opts ...StepOption) *Job {
 		raw:         handler,
 		concurrency: 1,
 		policy:      j.app.cfg.DefaultPolicy,
+	}
+	if sh, ok := handler.(streamHandler); ok {
+		for _, opt := range sh.opts {
+			opt(s)
+		}
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -185,7 +206,14 @@ func (j *Job) wire() error {
 		for _, id := range successors[step.id] {
 			nexts = append(nexts, byID[id])
 		}
-		h, err := makeStepHandler(step.raw, nexts)
+		flush := flushConfig{size: j.app.cfg.FlushSize, interval: j.app.cfg.FlushInterval}
+		if step.flushSize > 0 {
+			flush.size = step.flushSize
+		}
+		if step.flushInterval > 0 {
+			flush.interval = step.flushInterval
+		}
+		h, err := makeStepHandler(step.raw, nexts, flush, j.app.cfg.Clock)
 		if err != nil {
 			return fmt.Errorf("durableq: job %q step %q: %w", j.name, step.id, err)
 		}
@@ -262,9 +290,17 @@ func (j *Job) Run(ctx context.Context, input any) (storage.Execution, error) {
 // payload - carrying each successor's own retry policy onto the work it
 // creates. A downstream item is governed by the step that will run it, not by
 // the step that produced it.
-func makeStepHandler(handler any, nexts []*Step) (runtime.Handler, error) {
+func makeStepHandler(handler any, nexts []*Step, flush flushConfig, clock storage.Clock) (runtime.Handler, error) {
 	if handler == nil {
 		return nil, errors.New("step handler is nil")
+	}
+	if sh, ok := handler.(streamHandler); ok {
+		if len(nexts) == 0 {
+			return nil, errors.New(
+				"the last step produces output but has nowhere to send it; " +
+					"add another step or use a handler that returns only error")
+		}
+		return sh.build(nexts, flush, clock), nil
 	}
 	if h, ok := handler.(runtime.Handler); ok {
 		return h, nil
