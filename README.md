@@ -223,7 +223,8 @@ Items that were already flushed stay.
 A flush commits only while this worker holds the item's lease. If the handler
 overran `HandlerTimeout`, or another worker reclaimed the item, the flush
 inserts nothing. `Add` and `Flush` return an error that wraps
-`storage.ErrLeaseLost`.
+`storage.ErrLeaseLost`, and every later call returns the same error at once.
+After the handler returns, `Add` and `Flush` return `ErrOutClosed`.
 
 Processing is at-least-once. A retried streaming step sends the items it
 flushed in the earlier attempt again, so the successor steps must tolerate

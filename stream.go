@@ -77,7 +77,14 @@ func Stream[T, U any](fn func(ctx context.Context, in T, out Out[U]) error, opts
 			}
 			o.mu.Lock()
 			defer o.mu.Unlock()
+			o.closed = true
+			if o.dead != nil {
+				// A flush failed for good and the handler ignored it. The
+				// attempt cannot finish cleanly.
+				return runtime.HandlerResult{}, o.dead
+			}
 			rest, err := o.encodeBuffer()
+			o.buf = nil
 			if err != nil {
 				return runtime.HandlerResult{}, err
 			}
@@ -101,12 +108,29 @@ type streamOut[U any] struct {
 	mu        sync.Mutex
 	buf       []U
 	lastFlush time.Time
-	flushed   int // NewItems committed by earlier flushes
+	flushed   int   // NewItems committed by earlier flushes
+	closed    bool  // the handler has returned
+	dead      error // set once the lease is lost; every later call returns it
+}
+
+// ErrOutClosed is returned by Out.Add and Out.Flush after the handler that
+// owns the Out has returned. Nothing is committed.
+var ErrOutClosed = errors.New("durableq: output closed: the streaming handler has returned")
+
+// check reports why the Out can no longer take items. The caller holds mu.
+func (o *streamOut[U]) check() error {
+	if o.closed {
+		return ErrOutClosed
+	}
+	return o.dead
 }
 
 func (o *streamOut[U]) Add(items ...U) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if err := o.check(); err != nil {
+		return err
+	}
 	o.buf = append(o.buf, items...)
 	if len(o.buf) >= o.flush.size || o.clock.Now().Sub(o.lastFlush) >= o.flush.interval {
 		return o.flushLocked()
@@ -117,6 +141,9 @@ func (o *streamOut[U]) Add(items ...U) error {
 func (o *streamOut[U]) Flush() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if err := o.check(); err != nil {
+		return err
+	}
 	return o.flushLocked()
 }
 
@@ -130,7 +157,14 @@ func (o *streamOut[U]) flushLocked() error {
 		return err
 	}
 	if err := o.emitter.Emit(o.ctx, news); err != nil {
-		return fmt.Errorf("durableq: flushing streaming output: %w", err)
+		err = fmt.Errorf("durableq: flushing streaming output: %w", err)
+		if errors.Is(err, storage.ErrLeaseLost) {
+			// The lease is gone for good: drop the buffer and refuse all
+			// later calls without asking the store again.
+			o.dead = err
+			o.buf = nil
+		}
+		return err
 	}
 	o.flushed += len(news)
 	o.buf = o.buf[:0]
