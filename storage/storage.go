@@ -230,8 +230,13 @@ type CompleteRequest struct {
 // EmitRequest hands part of a running item's output to the next queues before
 // the item finishes. It commits only while Worker still holds the item's lease.
 type EmitRequest struct {
-	ID       int64
-	Worker   string
+	ID     int64
+	Worker string
+	// Attempt, when above zero, is the attempt number the emitter was claimed
+	// under. The emit commits only if the item is still on that attempt, so an
+	// abandoned earlier attempt cannot commit after the same worker re-claims
+	// the item. Zero skips the check.
+	Attempt  int
 	Produced []NewItem
 }
 
