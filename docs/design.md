@@ -425,13 +425,17 @@ Flush commits the buffer at once.
 
 A flush is one transaction.
 It adds the number of new items to the produced count of the running item, and it inserts the items.
-It matches only while the item is running and leased to this worker.
+It matches only while the item is running, leased to this worker, and still on the attempt the handler was claimed under.
 Otherwise it inserts nothing and returns ErrLeaseLost.
-This fences a handler that overran HandlerTimeout, and a lease that another worker reclaimed.
+This fences a handler that overran HandlerTimeout, a lease that another worker reclaimed, and an abandoned attempt after the same worker claimed the next one.
+A flush is also refused once the handler's context is done.
+After ErrLeaseLost the Out stays failed: it drops its buffer and returns the same error at once.
 
 When the handler returns nil, the remaining buffer commits together with the ack.
 Complete adds to the produced count, so flushes and the final commit sum up.
 When the handler returns an error, the buffer is dropped and flushed items stay.
+However the handler ends, the Out is then closed: a later Add or Flush returns ErrOutClosed and commits nothing.
+The outcome counts every attempt: an item that flushed in an earlier attempt is a success, even if the last attempt added nothing.
 Delivery is at-least-once: a retried streaming step sends its flushed items again.
 
 # 10. Execution and Lineage

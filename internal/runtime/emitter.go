@@ -11,9 +11,10 @@ import (
 	"github.com/unilinq/durableq/storage"
 )
 
-// emitTimeout bounds one Emit call. The call does not use the handler's own
-// context: the pool cancels that context when a handler overruns its timeout,
-// and the store must still be asked, so the fence can refuse the late commit.
+// emitTimeout bounds one Emit call. Emit refuses outright once the handler's
+// context is done; otherwise the store call runs on a context detached from
+// the handler's, so a cancellation that lands mid-call cannot leave it half
+// done, and the store's lease and attempt check stays the final word.
 const emitTimeout = 30 * time.Second
 
 // Emitter commits part of a running item's output while the handler runs. It

@@ -58,7 +58,10 @@ func TestEmitAttemptMismatchIsRejectedAndInsertsNothing(t *testing.T) {
 	if err != nil || got.Produced != 0 {
 		t.Fatalf("produced %d (%v), want 0", got.Produced, err)
 	}
-	stats, _ := store.Stats(t.Context(), "next")
+	stats, err := store.Stats(t.Context(), "next")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	for _, s := range stats {
 		if s.Queue == "next" && s.Ready > 0 {
 			t.Fatalf("emit under the old attempt inserted %d items", s.Ready)
@@ -82,7 +85,10 @@ func TestCompleteLargeProducedIsInsertedWhole(t *testing.T) {
 	if err != nil || res[0].Err != nil {
 		t.Fatalf("Complete: %v %v", err, res)
 	}
-	stats, _ := store.Stats(t.Context(), "next")
+	stats, err := store.Stats(t.Context(), "next")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
 	ready := 0
 	for _, s := range stats {
 		if s.Queue == "next" {
