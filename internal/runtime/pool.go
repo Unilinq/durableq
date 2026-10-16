@@ -344,6 +344,8 @@ func (p *Pool) finish(live *inflightItem, res HandlerResult, err error, took tim
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
+		// Each case records the outcome metric before it fires the test
+		// signal, so a test that wakes on the signal always sees the metric.
 		switch {
 		case err == nil:
 			p.ack(ctx, live.item, res)
@@ -352,12 +354,15 @@ func (p *Pool) finish(live *inflightItem, res HandlerResult, err error, took tim
 				outcome = telemetry.OutcomeFiltered
 			}
 			p.cfg.Metrics.ItemFinished(p.cfg.Queue, live.item.StepID, outcome, took)
+			p.TestSignals.Acked.Emit(live.item.ID)
 		case errors.Is(err, ErrDiscard), live.item.Policy.Exhausted(live.item.Attempt):
 			p.deadLetter(ctx, live.item, err.Error())
 			p.cfg.Metrics.ItemFinished(p.cfg.Queue, live.item.StepID, telemetry.OutcomeDeadLettered, took)
+			p.TestSignals.DeadLettered.Emit(live.item.ID)
 		default:
 			p.retry(ctx, live.item, err.Error())
 			p.cfg.Metrics.ItemFinished(p.cfg.Queue, live.item.StepID, telemetry.OutcomeRetried, took)
+			p.TestSignals.Retried.Emit(live.item.ID)
 		}
 	})
 }
@@ -391,7 +396,6 @@ func (p *Pool) ack(ctx context.Context, item storage.Item, res HandlerResult) {
 		Dropped: res.Dropped, Capped: res.Capped,
 	})
 	p.logResult("complete", item.ID, out, err)
-	p.TestSignals.Acked.Emit(item.ID)
 }
 
 func (p *Pool) retry(ctx context.Context, item storage.Item, msg string) {
@@ -399,7 +403,6 @@ func (p *Pool) retry(ctx context.Context, item storage.Item, msg string) {
 		ID: item.ID, Worker: p.cfg.Worker, Error: msg,
 	})
 	p.logResult("retry", item.ID, out, err)
-	p.TestSignals.Retried.Emit(item.ID)
 }
 
 func (p *Pool) deadLetter(ctx context.Context, item storage.Item, msg string) {
@@ -407,7 +410,6 @@ func (p *Pool) deadLetter(ctx context.Context, item storage.Item, msg string) {
 		ID: item.ID, Worker: p.cfg.Worker, Error: msg,
 	})
 	p.logResult("dead-letter", item.ID, out, err)
-	p.TestSignals.DeadLettered.Emit(item.ID)
 }
 
 // logResult reports a transition that did not apply. Losing a race with the
