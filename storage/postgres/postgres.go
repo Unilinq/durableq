@@ -262,11 +262,28 @@ func (s *Store) Enqueue(ctx context.Context, items ...storage.NewItem) ([]storag
 	return out, err
 }
 
+// enqueueChunk is the most items one INSERT statement carries.
+const enqueueChunk = 5000
+
 // enqueueTx inserts items inside an existing transaction. Complete uses it so
 // that acking a step and enqueuing the work it produced are one atomic write.
 func (s *Store) enqueueTx(ctx context.Context, tx pgx.Tx, now time.Time, items []storage.NewItem) ([]storage.Item, error) {
 	if len(items) == 0 {
 		return nil, nil
+	}
+	// One INSERT carries 9 parameters per item and Postgres allows 65535, so
+	// a large batch goes in as several INSERTs inside the same transaction.
+	if len(items) > enqueueChunk {
+		var all []storage.Item
+		for start := 0; start < len(items); start += enqueueChunk {
+			end := min(start+enqueueChunk, len(items))
+			got, err := s.enqueueTx(ctx, tx, now, items[start:end])
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, got...)
+		}
+		return all, nil
 	}
 	if err := s.ensureQueuesTx(ctx, tx, queueNames(items)); err != nil {
 		return nil, err

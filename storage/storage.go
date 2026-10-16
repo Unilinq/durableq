@@ -62,6 +62,10 @@ var (
 	// ErrWrongState means the item exists but is not in the state the
 	// operation requires; the operation was a no-op.
 	ErrWrongState = errors.New("durableq: item not in the expected state")
+	// ErrLeaseLost means the worker no longer holds the item: it is not
+	// running, or another worker owns its lease. The operation inserted
+	// nothing.
+	ErrLeaseLost = errors.New("durableq: lease lost")
 	// ErrNotImplemented marks a contract method an adapter has not built yet.
 	ErrNotImplemented = errors.New("durableq: not implemented")
 )
@@ -221,6 +225,14 @@ type CompleteRequest struct {
 	// bounded discovery step does not look like a silent leak.
 	Dropped int
 	Capped  bool
+}
+
+// EmitRequest hands part of a running item's output to the next queues before
+// the item finishes. It commits only while Worker still holds the item's lease.
+type EmitRequest struct {
+	ID       int64
+	Worker   string
+	Produced []NewItem
 }
 
 // RetryRequest returns a running item to ready after a failure, consuming the
@@ -423,6 +435,12 @@ type Store interface {
 	// Complete acks running items and enqueues their downstream work in the
 	// same transaction.
 	Complete(ctx context.Context, reqs ...CompleteRequest) ([]Result, error)
+
+	// Emit enqueues part of a running item's output while the item keeps
+	// running, and adds the number of items to the item's produced count. It
+	// commits only if the item is running and leased to req.Worker; otherwise
+	// it inserts nothing and returns an error wrapping ErrLeaseLost.
+	Emit(ctx context.Context, req EmitRequest) error
 
 	// Retry returns running items to ready, scheduled by policy.
 	Retry(ctx context.Context, reqs ...RetryRequest) ([]Result, error)
