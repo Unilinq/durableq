@@ -300,8 +300,7 @@ func TestStreamAddFlushesAfterFlushInterval(t *testing.T) {
 	job := app.Job("interval").
 		Step("discover", Stream(func(ctx context.Context, in discoverIn, out Out[crawlIn]) error {
 			// First flush: measured from the start of the handler. The test
-			// clock and the wall clock both move past the interval.
-			time.Sleep(2 * interval)
+			// clock moves past the interval.
 			app.clock.Advance(time.Second)
 			if err := out.Add(crawlIn{URL: "first"}); err != nil {
 				return err
@@ -313,7 +312,6 @@ func TestStreamAddFlushesAfterFlushInterval(t *testing.T) {
 			if err := out.Add(crawlIn{URL: "second"}); err != nil {
 				return err
 			}
-			time.Sleep(2 * interval)
 			app.clock.Advance(time.Second)
 			g.hit(ctx)
 
