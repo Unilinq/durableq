@@ -121,7 +121,6 @@ type streamOut[U any] struct {
 // owns the Out has returned. Nothing is committed.
 var ErrOutClosed = errors.New("durableq: output closed: the streaming handler has returned")
 
-// check reports why the Out can no longer take items. The caller holds mu.
 // close marks the Out closed and drops anything still buffered. The success
 // path has already taken the buffer by the time it runs.
 func (o *streamOut[U]) close() {
@@ -131,6 +130,7 @@ func (o *streamOut[U]) close() {
 	o.buf = nil
 }
 
+// check reports why the Out can no longer take items. The caller holds mu.
 func (o *streamOut[U]) check() error {
 	if o.closed {
 		return ErrOutClosed
