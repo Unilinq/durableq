@@ -72,6 +72,10 @@ func Stream[T, U any](fn func(ctx context.Context, in T, out Out[U]) error, opts
 				clock:     clock,
 				lastFlush: clock.Now(),
 			}
+			// However the handler ends (nil, an error or a panic), the Out is
+			// closed and its unflushed items are dropped, so a goroutine that
+			// kept it cannot commit them later.
+			defer o.close()
 			if err := fn(ctx, in, o); err != nil {
 				return runtime.HandlerResult{}, err
 			}
@@ -118,6 +122,15 @@ type streamOut[U any] struct {
 var ErrOutClosed = errors.New("durableq: output closed: the streaming handler has returned")
 
 // check reports why the Out can no longer take items. The caller holds mu.
+// close marks the Out closed and drops anything still buffered. The success
+// path has already taken the buffer by the time it runs.
+func (o *streamOut[U]) close() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed = true
+	o.buf = nil
+}
+
 func (o *streamOut[U]) check() error {
 	if o.closed {
 		return ErrOutClosed

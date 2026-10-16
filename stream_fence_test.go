@@ -196,3 +196,38 @@ func TestStreamOutIsDeadAfterLeaseLost(t *testing.T) {
 		t.Fatalf("store Emit called %d times, want 1", n)
 	}
 }
+
+// A handler that fails closes its Out too: a goroutine that kept it cannot
+// commit the items the failure dropped.
+func TestStreamOutIsClosedWhenTheHandlerFails(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t)
+
+	var kept Out[crawlIn]
+	job := app.Job("closed-on-error").
+		Step("discover", Stream(func(ctx context.Context, in discoverIn, out Out[crawlIn]) error {
+			kept = out
+			if err := out.Add(crawlIn{URL: "dropped"}); err != nil {
+				return err
+			}
+			return Discard(errors.New("boom"))
+		}, StepFlush(1000, time.Hour))).
+		Step("crawl", noop, After("discover"))
+
+	app.startJob(t, job)
+	exec, err := job.Run(t.Context(), discoverIn{Site: "s"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	app.waitForExecution(t, exec.ID, 1)
+
+	if err := kept.Flush(); !errors.Is(err, ErrOutClosed) {
+		t.Fatalf("Flush after a failed handler: got %v, want ErrOutClosed", err)
+	}
+	if err := kept.Add(crawlIn{URL: "late"}); !errors.Is(err, ErrOutClosed) {
+		t.Fatalf("Add after a failed handler: got %v, want ErrOutClosed", err)
+	}
+	if got := app.itemsOf(t, exec.ID, "crawl"); len(got) != 0 {
+		t.Fatalf("a failed handler's buffer reached the successor: %d items", len(got))
+	}
+}
