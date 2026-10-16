@@ -258,6 +258,7 @@ func (p *Pool) pollOnce(ctx context.Context) {
 // dispatch runs one item in its own goroutine, holding a worker slot.
 func (p *Pool) dispatch(parent context.Context, item storage.Item) {
 	handlerCtx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	handlerCtx = WithEmitter(handlerCtx, p.cfg.Store, p.cfg.Worker, item.ID, item.Attempt)
 	live := &inflightItem{item: item, cancel: cancel}
 
 	p.mu.Lock()

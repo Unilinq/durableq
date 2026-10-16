@@ -189,6 +189,47 @@ nothing is a terminal success recorded as *filtered*, so a deliberate filter is
 never mistaken for lost work. A step that exhausts its attempts is dead-lettered
 and produces nothing downstream, while every other item carries on.
 
+## Streaming steps
+
+A fan-out step sends its output when it returns. A step that turns one input
+into very many outputs can send them while it runs. Wrap the handler in
+`durableq.Stream`. It gets an `Out` handle bound to the item it runs.
+
+```go
+job := app.Job("document-ingestion").
+    Step("discover", durableq.Stream(func(ctx context.Context, in Site, out durableq.Out[Page]) error {
+        for batch := range pages(ctx, in.Root) {
+            if err := out.Add(batch...); err != nil {
+                return err
+            }
+        }
+        return nil
+    })).
+    Step("crawl", crawl, durableq.After("discover"))
+```
+
+`Add` buffers items for every successor step. DurableQ commits the buffer to
+the successor queues when it holds `FlushSize` items (default 500), or when
+`FlushInterval` (default 1s) has passed since the last flush. The interval is
+checked inside `Add`, so no background goroutine runs. `Flush` commits the
+buffer at once. When `Flush` returns nil, the items are durable and successor
+workers can claim them. `StepFlush(size, interval)` overrides both settings for
+one step.
+
+When the handler returns nil, items still in the buffer are committed with the
+ack, in one transaction. When it returns an error, the buffer is dropped.
+Items that were already flushed stay.
+
+A flush commits only while this worker holds the item's lease. If the handler
+overran `HandlerTimeout`, or another worker reclaimed the item, the flush
+inserts nothing. `Add` and `Flush` return an error that wraps
+`storage.ErrLeaseLost`, and every later call returns the same error at once.
+After the handler returns, `Add` and `Flush` return `ErrOutClosed`.
+
+Processing is at-least-once. A retried streaming step sends the items it
+flushed in the earlier attempt again, so the successor steps must tolerate
+duplicates. A streaming step needs at least one successor step.
+
 ## Asking what happened
 
 ```go
@@ -257,6 +298,8 @@ the item, which is what makes `-error-contains` replay useful after a fix.
 | `HandlerTimeout` | 5m | A handler that overruns frees its worker slot and the item is retried. |
 | `DrainTimeout` | 30s | How long `Stop` waits before handing work back. |
 | `Retention` | 7 days | How long completed items are kept. `storage.RetentionNever` keeps them for ever. Dead-lettered items are never swept. |
+| `FlushSize` | 500 | Items a streaming step buffers before it commits them. `StepFlush` sets it per step. |
+| `FlushInterval` | 1s | Longest a streaming step holds buffered items; checked inside `Add`. |
 | `DefaultPolicy` | 5 attempts, 5s / 30s / 2m / 10m, 10% jitter | Per queue with `WithPolicy`, per step with `StepPolicy`. |
 
 The policy is snapshotted onto an item when it is enqueued, so changing a

@@ -46,6 +46,7 @@ func Run(t *testing.T, h Harness) {
 	t.Run("NotFound", func(t *testing.T) { runNotFound(t, h) })
 	t.Run("WrongState", func(t *testing.T) { runWrongState(t, h) })
 	t.Run("Batch", func(t *testing.T) { runBatch(t, h) })
+	t.Run("Emit", func(t *testing.T) { runEmit(t, h) })
 	t.Run("Lease", func(t *testing.T) { runLease(t, h) })
 	t.Run("Replay", func(t *testing.T) { runReplay(t, h) })
 	t.Run("Sweep", func(t *testing.T) { runSweep(t, h) })

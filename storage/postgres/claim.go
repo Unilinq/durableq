@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -134,9 +135,11 @@ func (s *Store) Complete(ctx context.Context, reqs ...storage.CompleteRequest) (
 
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		sql := `UPDATE ` + s.tbl("durableq_items") + `
-			SET state = 'done', outcome = $2, finalized_at = $3, updated_at = $3,
+			SET state = 'done',
+			    outcome = CASE WHEN $2::text = 'filtered' AND produced + $4 > 0 THEN 'success' ELSE $2::text END,
+			    finalized_at = $3, updated_at = $3,
 			    leased_by = NULL, lease_until = NULL,
-			    produced = $4, dropped = $5, produced_capped = $6
+			    produced = produced + $4, dropped = $5, produced_capped = $6
 			WHERE id = $1 AND state = 'running'
 			  AND ($7::text IS NULL OR leased_by = $7)
 			RETURNING id`
@@ -160,11 +163,14 @@ func (s *Store) Complete(ctx context.Context, reqs ...storage.CompleteRequest) (
 			if !ok[i] {
 				continue
 			}
-			outcome := "success"
-			if r.Filtered {
-				outcome = "filtered"
-			}
-			s.finishAttempt(attempts, r.ID, now, outcome, "")
+			// The attempt row takes the outcome the item row just got: a
+			// filtered attempt of an item that produced output earlier is a
+			// success.
+			attempts.Queue(`UPDATE `+s.tbl("durableq_attempts")+`
+				SET ended_at = $2,
+				    outcome = (SELECT outcome FROM `+s.tbl("durableq_items")+` WHERE id = $1),
+				    error = NULL
+				WHERE item_pk = $1 AND ended_at IS NULL`, r.ID, now)
 			downstream = append(downstream, r.Produced...)
 		}
 		if attempts.Len() > 0 {
@@ -186,6 +192,33 @@ func (s *Store) Complete(ctx context.Context, reqs ...storage.CompleteRequest) (
 		return nil
 	})
 	return results, err
+}
+
+// Emit enqueues part of a running item's output and adds it to the item's
+// produced count, in one transaction. The update matches only while the item is
+// running and leased to this worker; no match inserts nothing.
+func (s *Store) Emit(ctx context.Context, req storage.EmitRequest) error {
+	if len(req.Produced) == 0 {
+		return nil
+	}
+	now := s.now(time.Time{})
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		var id int64
+		err := tx.QueryRow(ctx, `UPDATE `+s.tbl("durableq_items")+`
+			SET produced = produced + $2, updated_at = $3
+			WHERE id = $1 AND state = 'running' AND leased_by = $4
+			  AND ($5 <= 0 OR attempt = $5)
+			RETURNING id`,
+			req.ID, len(req.Produced), now, s.workerArg(req.Worker), req.Attempt).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: id %d", storage.ErrLeaseLost, req.ID)
+		}
+		if err != nil {
+			return err
+		}
+		_, err = s.enqueueTx(ctx, tx, now, req.Produced)
+		return err
+	})
 }
 
 // Retry returns running items to ready after a failure. The attempt was
