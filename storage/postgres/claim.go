@@ -92,12 +92,15 @@ func (s *Store) workerArg(worker string) *string {
 }
 
 // classify explains why a state transition matched no rows: either the item is
-// gone, or it is not in the state the transition requires.
+// gone, or it is not in the state the transition requires. An item a fold
+// swept was done, and is reported as done rather than missing.
 func (s *Store) classify(ctx context.Context, tx pgx.Tx, id int64) error {
 	var state string
 	var leasedBy *string
-	err := tx.QueryRow(ctx,
-		`SELECT state, leased_by FROM `+s.tbl("durableq_items")+` WHERE id = $1`, id).
+	err := tx.QueryRow(ctx, `
+		SELECT state, leased_by FROM `+s.tbl("durableq_items")+` WHERE id = $1
+		UNION ALL
+		SELECT 'done', NULL FROM `+s.tbl("durableq_item_history")+` WHERE id = $1`, id).
 		Scan(&state, &leasedBy)
 	if err == pgx.ErrNoRows {
 		return fmt.Errorf("%w: id %d", storage.ErrNotFound, id)

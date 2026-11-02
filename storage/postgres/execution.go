@@ -144,25 +144,30 @@ func (s *Store) ExecutionSteps(ctx context.Context, id string) ([]storage.StepDe
 	return out, nil
 }
 
-// StepCounts derives the per-step tallies for an execution from durable item
-// state. Nothing here reads an in-memory counter, so the numbers are the same
-// whichever process asks and whenever it asks.
+// StepCounts derives the per-step tallies for an execution from durable
+// state: the items still in the table plus the saved counts of the items a
+// fold swept, read in one statement so an item being folded is counted
+// exactly once. Nothing here reads an in-memory counter, so the numbers are
+// the same whichever process asks and whenever it asks.
 func (s *Store) StepCounts(ctx context.Context, executionID string) ([]storage.StepCount, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT st.step_id, st.idx, st.queue,
-		       count(i.id)::int                                                      AS received,
-		       count(*) FILTER (WHERE i.state = 'done' AND i.outcome = 'success')::int  AS succeeded,
-		       count(*) FILTER (WHERE i.state = 'done' AND i.outcome = 'filtered')::int AS filtered,
-		       count(*) FILTER (WHERE i.state = 'dlq')::int                            AS dlq,
-		       count(*) FILTER (WHERE i.state IN ('ready', 'running'))::int            AS active,
-		       COALESCE(sum(i.produced), 0)::int                                       AS produced,
-		       COALESCE(sum(i.dropped), 0)::int                                        AS dropped,
-		       count(*) FILTER (WHERE i.produced_capped)::int                          AS capped
+		       (count(i.id) + COALESCE(sc.succeeded + sc.filtered, 0))::bigint                        AS received,
+		       (count(*) FILTER (WHERE i.state = 'done' AND i.outcome = 'success') + COALESCE(sc.succeeded, 0))::bigint AS succeeded,
+		       (count(*) FILTER (WHERE i.state = 'done' AND i.outcome = 'filtered') + COALESCE(sc.filtered, 0))::bigint AS filtered,
+		       count(*) FILTER (WHERE i.state = 'dlq')::bigint                                          AS dlq,
+		       count(*) FILTER (WHERE i.state IN ('ready', 'running'))::bigint                          AS active,
+		       (COALESCE(sum(i.produced), 0) + COALESCE(sc.produced, 0))::bigint                        AS produced,
+		       (COALESCE(sum(i.dropped), 0) + COALESCE(sc.dropped, 0))::bigint                          AS dropped,
+		       (count(*) FILTER (WHERE i.produced_capped) + COALESCE(sc.capped, 0))::bigint             AS capped
 		FROM `+s.tbl("durableq_steps")+` st
+		LEFT JOIN `+s.tbl("durableq_step_counts")+` sc
+		       ON sc.execution_id = st.execution_id AND sc.step_id = st.step_id
 		LEFT JOIN `+s.tbl("durableq_items")+` i
 		       ON i.execution_id = st.execution_id AND i.step_id = st.step_id
 		WHERE st.execution_id = $1
-		GROUP BY st.step_id, st.idx, st.queue
+		GROUP BY st.step_id, st.idx, st.queue,
+		         sc.succeeded, sc.filtered, sc.produced, sc.dropped, sc.capped
 		ORDER BY st.idx`, executionID)
 	if err != nil {
 		return nil, err
@@ -181,18 +186,24 @@ func (s *Store) StepCounts(ctx context.Context, executionID string) ([]storage.S
 }
 
 // Lineage answers "where is item ABC?" for one execution: every step in order,
-// with what happened there, including the steps the item never reached.
+// with what happened there, including the steps the item never reached. An
+// item a fold swept is read from its history, in the same statement.
 func (s *Store) Lineage(ctx context.Context, executionID, itemID string) ([]storage.LineageEntry, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT st.step_id, st.idx,
 		       i.id, i.state, i.outcome, i.attempt, i.last_error, i.produced
 		FROM `+s.tbl("durableq_steps")+` st
-		LEFT JOIN `+s.tbl("durableq_items")+` i
-		       ON i.execution_id = st.execution_id
-		      AND i.step_id = st.step_id
-		      AND i.item_id = $2
+		LEFT JOIN (
+			SELECT id, step_id, state, outcome, attempt, last_error, produced
+			FROM `+s.tbl("durableq_items")+`
+			WHERE execution_id = $1 AND item_id = $2
+			UNION ALL
+			SELECT id, step_id, 'done', outcome, attempt, last_error, produced
+			FROM `+s.tbl("durableq_item_history")+`
+			WHERE execution_id = $1 AND item_id = $2
+		) i ON i.step_id = st.step_id
 		WHERE st.execution_id = $1
-		ORDER BY st.idx`, executionID, itemID)
+		ORDER BY st.idx, i.id`, executionID, itemID)
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +242,45 @@ func (s *Store) Lineage(ctx context.Context, executionID, itemID string) ([]stor
 			e.Produced = *produced
 		}
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// FilteredByLabel counts, per step of an execution, the filtered items whose
+// payload has a label set to true: the done items still in the table plus the
+// saved counts of the items a fold swept with that label in
+// SweepOpts.FilterLabels, read in one statement. The result maps step id to
+// label to count, with every step and label present.
+func (s *Store) FilteredByLabel(ctx context.Context, executionID string, labels ...string) (map[string]map[string]int, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT st.step_id, l.label,
+		       (SELECT count(*) FROM `+s.tbl("durableq_items")+` i
+		        WHERE i.execution_id = st.execution_id AND i.step_id = st.step_id
+		          AND i.state = 'done' AND i.outcome = 'filtered'
+		          AND i.payload ->> l.label = 'true')
+		       + COALESCE((SELECT (sc.filtered_by ->> l.label)::bigint
+		                   FROM `+s.tbl("durableq_step_counts")+` sc
+		                   WHERE sc.execution_id = st.execution_id AND sc.step_id = st.step_id), 0)
+		FROM `+s.tbl("durableq_steps")+` st
+		CROSS JOIN unnest($2::text[]) AS l(label)
+		WHERE st.execution_id = $1`, executionID, labels)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]map[string]int{}
+	for rows.Next() {
+		var (
+			step, label string
+			n           int
+		)
+		if err := rows.Scan(&step, &label, &n); err != nil {
+			return nil, err
+		}
+		if out[step] == nil {
+			out[step] = map[string]int{}
+		}
+		out[step][label] = n
 	}
 	return out, rows.Err()
 }

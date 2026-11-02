@@ -38,6 +38,11 @@ type Config struct {
 	// LeasedByMax truncates the worker identity written to leased_by, matching
 	// what the column can hold. Zero means 128.
 	LeasedByMax int
+	// DoneWindow is how far back Stats counts done items a fold swept, by
+	// when they finished, and how long PrepareFold keeps their tallies.
+	// Done items still in the table are always counted. Zero means 7 days,
+	// the default retention, so Stats reports what it did before folding.
+	DoneWindow time.Duration
 }
 
 // Store is the PostgreSQL implementation of storage.Store.
@@ -47,6 +52,7 @@ type Store struct {
 	clock         storage.Clock
 	defaultPolicy storage.Policy
 	leasedByMax   int
+	doneWindow    time.Duration
 
 	randMu sync.Mutex
 	rand   *rand.Rand
@@ -75,12 +81,17 @@ func New(cfg Config) (*Store, error) {
 	if max == 0 {
 		max = 128
 	}
+	doneWindow := cfg.DoneWindow
+	if doneWindow <= 0 {
+		doneWindow = 7 * 24 * time.Hour
+	}
 	return &Store{
 		pool:          cfg.Pool,
 		schema:        schema,
 		clock:         clock,
 		defaultPolicy: policy,
 		leasedByMax:   max,
+		doneWindow:    doneWindow,
 		rand:          rand.New(rand.NewSource(time.Now().UnixNano())),
 	}, nil
 }
@@ -101,6 +112,11 @@ func (s *Store) now(override time.Time) time.Time {
 		return override.UTC()
 	}
 	return s.clock.Now().UTC()
+}
+
+// doneSince is the first hour of folded done items Stats counts at now.
+func (s *Store) doneSince(now time.Time) time.Time {
+	return now.Add(-s.doneWindow).Truncate(time.Hour)
 }
 
 // jitter returns d adjusted by up to +/-frac, never negative.
@@ -179,6 +195,7 @@ func scanItem(row rowScanner) (storage.Item, error) {
 	var (
 		it           storage.Item
 		outcome      *string
+		availableAt  *time.Time
 		leasedBy     *string
 		leaseUntil   *time.Time
 		lastError    *string
@@ -192,7 +209,7 @@ func scanItem(row rowScanner) (storage.Item, error) {
 	)
 	err := row.Scan(
 		&it.ID, &it.Queue, &it.Payload, &it.State, &outcome, &it.Attempt, &it.MaxAttempts,
-		&it.AvailableAt, &leasedBy, &leaseUntil, &lastError, &lastWorker,
+		&availableAt, &leasedBy, &leaseUntil, &lastError, &lastWorker,
 		&executionID, &stepID, &itemID, &parentItemID,
 		&it.Produced, &it.Dropped, &it.ProducedCapped, &policyRaw,
 		&it.CreatedAt, &it.UpdatedAt, &finalizedAt,
@@ -230,12 +247,17 @@ func scanItem(row rowScanner) (storage.Item, error) {
 	if finalizedAt != nil {
 		it.FinalizedAt = finalizedAt.UTC()
 	}
-	p, err := decodePolicy(policyRaw)
-	if err != nil {
-		return storage.Item{}, err
+	if availableAt != nil {
+		it.AvailableAt = availableAt.UTC()
 	}
-	it.Policy = p
-	it.AvailableAt = it.AvailableAt.UTC()
+	// A live item always has a policy; one read back from history has none.
+	if policyRaw != nil {
+		p, err := decodePolicy(policyRaw)
+		if err != nil {
+			return storage.Item{}, err
+		}
+		it.Policy = p
+	}
 	it.CreatedAt = it.CreatedAt.UTC()
 	it.UpdatedAt = it.UpdatedAt.UTC()
 	return it, nil
@@ -367,9 +389,23 @@ func (s *Store) ensureQueuesTx(ctx context.Context, tx pgx.Tx, names []string) e
 	return err
 }
 
-// GetItem reads one item by id.
+// historyItemColumns reads a durableq_item_history row in itemColumns order.
+// A folded item was done, its updated_at was its finalized_at, and its last
+// worker is the worker of its last attempt; its payload, policy and
+// available_at are not kept.
+const historyItemColumns = `h.id, h.queue, NULL::jsonb, 'done', h.outcome, h.attempt, h.max_attempts,
+	NULL::timestamptz, NULL::text, NULL::timestamptz, h.last_error, h.attempts -> -1 ->> 'worker',
+	h.execution_id, h.step_id, h.item_id, h.parent_item_id,
+	h.produced, h.dropped, h.produced_capped, NULL::jsonb, h.created_at, h.finalized_at, h.finalized_at`
+
+// GetItem reads one item by id, from its row or, once a fold swept it, from
+// its history. One statement reads both, so an item being folded is found in
+// exactly one of them.
 func (s *Store) GetItem(ctx context.Context, id int64) (storage.Item, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+itemColumns+` FROM `+s.tbl("durableq_items")+` WHERE id = $1`, id)
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+itemColumns+` FROM `+s.tbl("durableq_items")+` WHERE id = $1
+		UNION ALL
+		SELECT `+historyItemColumns+` FROM `+s.tbl("durableq_item_history")+` h WHERE h.id = $1`, id)
 	it, err := scanItem(row)
 	if err == pgx.ErrNoRows {
 		return storage.Item{}, fmt.Errorf("%w: id %d", storage.ErrNotFound, id)
@@ -378,21 +414,28 @@ func (s *Store) GetItem(ctx context.Context, id int64) (storage.Item, error) {
 }
 
 // Stats returns per-queue counts. With no queues it reports every known queue.
+//
+// Done counts the done rows still in the table plus the items a fold swept
+// that finished within the store's DoneWindow, read in one statement.
 func (s *Store) Stats(ctx context.Context, queues ...string) ([]storage.QueueStat, error) {
 	q := `SELECT q.name,
 			COALESCE(SUM(CASE WHEN i.state = 'ready' THEN 1 ELSE 0 END), 0)::int,
 			COALESCE(SUM(CASE WHEN i.state = 'running' THEN 1 ELSE 0 END), 0)::int,
-			COALESCE(SUM(CASE WHEN i.state = 'done' THEN 1 ELSE 0 END), 0)::int,
+			(COALESCE(SUM(CASE WHEN i.state = 'done' THEN 1 ELSE 0 END), 0) + COALESCE(t.done, 0))::bigint,
 			COALESCE(SUM(CASE WHEN i.state = 'dlq' THEN 1 ELSE 0 END), 0)::int,
 			(q.paused_at IS NOT NULL)
 		FROM ` + s.tbl("durableq_queues") + ` q
+		LEFT JOIN (
+			SELECT queue, sum(done) AS done FROM ` + s.tbl("durableq_done_hourly") + `
+			WHERE hour >= $1 GROUP BY queue
+		) t ON t.queue = q.name
 		LEFT JOIN ` + s.tbl("durableq_items") + ` i ON i.queue = q.name`
-	var args []any
+	args := []any{s.doneSince(s.now(time.Time{}))}
 	if len(queues) > 0 {
-		q += ` WHERE q.name = ANY($1)`
+		q += ` WHERE q.name = ANY($2)`
 		args = append(args, queues)
 	}
-	q += ` GROUP BY q.name, q.paused_at ORDER BY q.name`
+	q += ` GROUP BY q.name, q.paused_at, t.done ORDER BY q.name`
 
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {

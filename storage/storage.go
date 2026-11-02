@@ -55,6 +55,11 @@ func BaseQueue(dlq string) string { return strings.TrimSuffix(dlq, DLQSuffix) }
 // RetentionNever disables retention sweeping for a state.
 const RetentionNever = time.Duration(-1)
 
+// RetentionZero makes every done item due at the next sweep. It exists for
+// settings where a zero duration means "the default", such as
+// durableq.Config.Retention; SweepOpts treats it as zero.
+const RetentionZero = time.Duration(-2)
+
 // Errors returned by Store implementations. Callers compare with errors.Is.
 var (
 	// ErrNotFound means no item exists with the given id.
@@ -288,11 +293,57 @@ type ReplayOpts struct {
 type SweepOpts struct {
 	// Queue limits the sweep. Empty sweeps every queue.
 	Queue string
-	// Retention is how long a done item is kept. RetentionNever disables it.
+	// Retention is how long a done item is kept. RetentionNever disables it;
+	// zero and RetentionZero make every item finalized before Now due.
 	Retention time.Duration
 	// Limit bounds one sweep batch.
 	Limit int
 	Now   time.Time
+	// After skips items finalized before it, so a caller sweeping in batches
+	// can start each batch where the last one ended (SweepResult.Last). The
+	// bound is inclusive, so items sharing that timestamp are not skipped.
+	// Zero starts at the oldest item.
+	After time.Time
+
+	// Fold makes the statement that deletes the items also add them to the
+	// saved counts, the per-hour done tally and the item history, so readers
+	// report the same numbers after the sweep as before it. Only stores that
+	// implement Folder support it; call PrepareFold first.
+	Fold bool
+	// HistoryRetention is how long a folded item's history is kept, measured
+	// from when it finished. It must match the PrepareFold call. Items that
+	// finished longer ago than this are counted but given no history.
+	HistoryRetention time.Duration
+	// FilterLabels maps a job name to boolean payload fields. A folded item
+	// of that job that finished filtered, with one of those fields true in
+	// its payload, is counted under that label as well as under filtered.
+	FilterLabels map[string][]string
+}
+
+// SweepResult reports one sweep batch.
+type SweepResult struct {
+	// Deleted is how many items the batch deleted.
+	Deleted int
+	// Last is the newest finalized_at among them, zero when none were
+	// deleted. Passing it as the next batch's After continues the sweep.
+	Last time.Time
+}
+
+// FoldOpts prepares a store to fold swept items.
+type FoldOpts struct {
+	Now time.Time
+	// HistoryRetention is how long item history is kept; older history is
+	// dropped.
+	HistoryRetention time.Duration
+}
+
+// Folder is implemented by stores that can fold swept items into saved counts
+// and item history (SweepOpts.Fold).
+type Folder interface {
+	// PrepareFold makes sure the history can take items finished up to Now,
+	// drops history older than HistoryRetention and prunes done tallies no
+	// reader reports any more. A sweeper that folds calls it once per pass.
+	PrepareFold(ctx context.Context, opts FoldOpts) error
 }
 
 // ReclaimOpts controls recovery of items whose lease expired.
@@ -389,7 +440,8 @@ type LineageEntry struct {
 }
 
 // StepCount is the per-edge tally a projection is built from. Every field is
-// derived from durable item state, never from an in-memory counter.
+// derived from durable state, never from an in-memory counter: the live items,
+// plus the saved counts of the items a fold swept (SweepOpts.Fold).
 type StepCount struct {
 	StepID    string
 	Idx       int
@@ -466,9 +518,9 @@ type Store interface {
 	// Replay returns dead-lettered items to their working queue.
 	Replay(ctx context.Context, opts ReplayOpts) (int, error)
 
-	// Sweep deletes terminal items past retention. Never deletes DLQ items,
-	// running items, or ready items.
-	Sweep(ctx context.Context, opts SweepOpts) (int, error)
+	// Sweep deletes one batch of terminal items past retention, oldest
+	// first. Never deletes DLQ items, running items, or ready items.
+	Sweep(ctx context.Context, opts SweepOpts) (SweepResult, error)
 
 	// Stats returns per-queue counts. With no queues, returns every queue.
 	Stats(ctx context.Context, queues ...string) ([]QueueStat, error)
@@ -479,7 +531,8 @@ type Store interface {
 	// ResumeQueue undoes PauseQueue.
 	ResumeQueue(ctx context.Context, queue string) error
 
-	// GetItem reads one item by id.
+	// GetItem reads one item by id. An item a fold swept is read back from
+	// its history, without its Payload, Policy or AvailableAt.
 	GetItem(ctx context.Context, id int64) (Item, error)
 
 	// Close releases resources held by the store.

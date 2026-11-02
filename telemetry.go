@@ -71,6 +71,18 @@ type Observer interface {
 	ItemsSwept(deleted int)
 }
 
+// SweepObserver is an optional extension of Observer. An Observer that also
+// implements it is told, after every retention sweep pass, how far behind the
+// sweep is.
+type SweepObserver interface {
+	// SweepBacklog reports how long before the cutoff the newest item the
+	// pass deleted was finalized, when the pass ran out of time with due
+	// items left (Config.SweepBudget). Zero means the pass caught up. A
+	// backlog that keeps growing means completed items arrive faster than
+	// they are swept.
+	SweepBacklog(backlog time.Duration)
+}
+
 // NopObserver discards everything. It is the default, so an application that
 // does not want metrics pays nothing.
 type NopObserver struct{}
@@ -118,3 +130,9 @@ func (s observerSink) QueueDepth(queue string, ready, running, dlq int) {
 }
 
 func (s observerSink) ItemsSwept(deleted int) { s.o.ItemsSwept(deleted) }
+
+func (s observerSink) SweepBacklog(backlog time.Duration) {
+	if so, ok := s.o.(SweepObserver); ok {
+		so.SweepBacklog(backlog)
+	}
+}

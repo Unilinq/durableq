@@ -62,44 +62,6 @@ func (s *Store) Replay(ctx context.Context, opts storage.ReplayOpts) (int, error
 	return moved, err
 }
 
-// Sweep deletes terminal successes past their retention.
-//
-// Dead-lettered items are never swept, whatever the retention: the DLQ is the
-// record of what went wrong, and deleting it on a timer would destroy the only
-// evidence an operator has. Running and ready items are never touched either,
-// so a sweep can never race a live lease.
-func (s *Store) Sweep(ctx context.Context, opts storage.SweepOpts) (int, error) {
-	if opts.Retention == storage.RetentionNever {
-		return 0, nil
-	}
-	if opts.Retention < 0 {
-		return 0, nil
-	}
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 1000
-	}
-	cutoff := s.now(opts.Now).Add(-opts.Retention)
-
-	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM `+s.tbl("durableq_items")+` i
-		USING (
-			SELECT id FROM `+s.tbl("durableq_items")+`
-			WHERE state = 'done'
-			  AND finalized_at < $1
-			  AND ($2::text IS NULL OR queue = $2)
-			ORDER BY finalized_at
-			LIMIT $3
-			FOR UPDATE SKIP LOCKED
-		) c
-		WHERE i.id = c.id`,
-		cutoff, nullable(opts.Queue), limit)
-	if err != nil {
-		return 0, err
-	}
-	return int(tag.RowsAffected()), nil
-}
-
 // ListItems returns items matching a filter, newest first. It backs the CLI's
 // dead-letter listing and the lineage queries the job layer needs.
 func (s *Store) ListItems(ctx context.Context, f storage.ItemFilter) ([]storage.Item, error) {
@@ -147,12 +109,23 @@ func (s *Store) ListItems(ctx context.Context, f storage.ItemFilter) ([]storage.
 	return out, rows.Err()
 }
 
-// Attempts returns the attempt history for one item, oldest first.
+// Attempts returns the attempt history for one item, oldest first. An item a
+// fold swept keeps its attempts in its history, read in the same statement.
 func (s *Store) Attempts(ctx context.Context, id int64) ([]storage.Attempt, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT attempt, worker, started_at, ended_at, outcome, error
-		FROM `+s.tbl("durableq_attempts")+`
-		WHERE item_pk = $1 ORDER BY attempt, id`, id)
+		SELECT attempt, worker, started_at, ended_at, outcome, error FROM (
+			SELECT attempt, worker, started_at, ended_at, outcome, error, id AS seq
+			FROM `+s.tbl("durableq_attempts")+`
+			WHERE item_pk = $1
+			UNION ALL
+			SELECT (a.v ->> 'attempt')::int, a.v ->> 'worker',
+			       (a.v ->> 'started_at')::timestamptz, (a.v ->> 'ended_at')::timestamptz,
+			       a.v ->> 'outcome', a.v ->> 'error', a.seq
+			FROM `+s.tbl("durableq_item_history")+` h
+			CROSS JOIN LATERAL jsonb_array_elements(h.attempts) WITH ORDINALITY AS a(v, seq)
+			WHERE h.id = $1
+		) t
+		ORDER BY attempt, seq`, id)
 	if err != nil {
 		return nil, err
 	}

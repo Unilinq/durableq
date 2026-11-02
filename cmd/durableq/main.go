@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -42,7 +43,7 @@ Commands:
   runs                  list recent job executions
   run <exec-id>         show a run: per-step counts and any leaks
   trace <exec-id> <item-id>   follow one item through every step
-  gc                    delete completed items past retention
+  gc                    delete completed items past retention (-fold keeps their counts)
   pause <queue>         stop workers claiming a queue
   resume <queue>        undo pause
 
@@ -61,10 +62,14 @@ func main() {
 type globals struct {
 	databaseURL string
 	schema      string
+	// out receives every command's output.
+	out io.Writer
+	// pool, when set, is used instead of connecting to databaseURL.
+	pool *pgxpool.Pool
 }
 
 func run() error {
-	var g globals
+	g := globals{out: os.Stdout}
 	fs := flag.NewFlagSet("durableq", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -127,6 +132,10 @@ func (g globals) connect(ctx context.Context) (*pgx.Conn, error) {
 }
 
 func (g globals) store(ctx context.Context) (*postgres.Store, func(), error) {
+	if g.pool != nil {
+		st, err := postgres.New(postgres.Config{Pool: g.pool, Schema: g.schema})
+		return st, func() {}, err
+	}
 	pool, err := pgxpool.New(ctx, g.databaseURL)
 	if err != nil {
 		return nil, nil, err
@@ -158,13 +167,13 @@ func cmdMigrate(ctx context.Context, g globals, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("schema %s is at version %d\n", g.schema, v)
+		fmt.Fprintf(g.out, "schema %s is at version %d\n", g.schema, v)
 		return nil
 	case "down":
 		if err := postgres.MigrateDown(ctx, conn, g.schema, 0); err != nil {
 			return err
 		}
-		fmt.Printf("schema %s rolled back\n", g.schema)
+		fmt.Fprintf(g.out, "schema %s rolled back\n", g.schema)
 		return nil
 	case "status":
 		v, err := postgres.AppliedVersion(ctx, conn, g.schema)
@@ -179,7 +188,7 @@ func cmdMigrate(ctx context.Context, g globals, args []string) error {
 		if len(migrations) > 0 {
 			latest = migrations[len(migrations)-1].Version
 		}
-		fmt.Printf("applied %d, latest %d\n", v, latest)
+		fmt.Fprintf(g.out, "applied %d, latest %d\n", v, latest)
 		return nil
 	default:
 		return fmt.Errorf("unknown migrate subcommand %q", args[0])
@@ -198,10 +207,10 @@ func cmdQueues(ctx context.Context, g globals) error {
 		return err
 	}
 	if len(stats) == 0 {
-		fmt.Println("no queues")
+		fmt.Fprintln(g.out, "no queues")
 		return nil
 	}
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	w := tabwriter.NewWriter(g.out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "QUEUE\tREADY\tRUNNING\tDONE\tDLQ\tPAUSED")
 	for _, s := range stats {
 		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%v\n", s.Queue, s.Ready, s.Running, s.Done, s.DLQ, s.Paused)
@@ -241,10 +250,10 @@ func cmdDLQ(ctx context.Context, g globals, args []string) error {
 			return err
 		}
 		if len(items) == 0 {
-			fmt.Printf("%s is empty\n", queue)
+			fmt.Fprintf(g.out, "%s is empty\n", queue)
 			return nil
 		}
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		w := tabwriter.NewWriter(g.out, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(w, "ID\tATTEMPTS\tWORKER\tFAILED AT\tERROR")
 		for _, it := range items {
 			fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\n",
@@ -259,14 +268,14 @@ func cmdDLQ(ctx context.Context, g globals, args []string) error {
 			ErrorContains: *errorContains,
 			OnBatch: func(moved, total int) {
 				if moved > 0 {
-					fmt.Printf("replayed %d (%d total)\n", moved, total)
+					fmt.Fprintf(g.out, "replayed %d (%d total)\n", moved, total)
 				}
 			},
 		})
 		if err != nil {
 			return err
 		}
-		fmt.Printf("replayed %d items from %s to %s\n", moved, queue, storage.BaseQueue(queue))
+		fmt.Fprintf(g.out, "replayed %d items from %s to %s\n", moved, queue, storage.BaseQueue(queue))
 		return nil
 	default:
 		return fmt.Errorf("unknown dlq subcommand %q", sub)
@@ -292,16 +301,16 @@ func cmdItem(ctx context.Context, g globals, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("item      %d\nqueue     %s\nstate     %s\n", it.ID, it.Queue, it.State)
+	fmt.Fprintf(g.out, "item      %d\nqueue     %s\nstate     %s\n", it.ID, it.Queue, it.State)
 	if it.Outcome != "" {
-		fmt.Printf("outcome   %s\n", it.Outcome)
+		fmt.Fprintf(g.out, "outcome   %s\n", it.Outcome)
 	}
-	fmt.Printf("attempts  %d of %d\n", it.Attempt, it.MaxAttempts)
+	fmt.Fprintf(g.out, "attempts  %d of %d\n", it.Attempt, it.MaxAttempts)
 	if it.ExecutionID != "" {
-		fmt.Printf("execution %s\nstep      %s\nitem key  %s\n", it.ExecutionID, it.StepID, it.ItemID)
+		fmt.Fprintf(g.out, "execution %s\nstep      %s\nitem key  %s\n", it.ExecutionID, it.StepID, it.ItemID)
 	}
 	if it.LastError != "" {
-		fmt.Printf("error     %s\n", it.LastError)
+		fmt.Fprintf(g.out, "error     %s\n", it.LastError)
 	}
 
 	attempts, err := st.Attempts(ctx, id)
@@ -311,8 +320,8 @@ func cmdItem(ctx context.Context, g globals, args []string) error {
 	if len(attempts) == 0 {
 		return nil
 	}
-	fmt.Println()
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(g.out)
+	w := tabwriter.NewWriter(g.out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "ATTEMPT\tWORKER\tSTARTED\tOUTCOME\tERROR")
 	for _, a := range attempts {
 		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n",
@@ -354,13 +363,13 @@ func cmdRuns(ctx context.Context, g globals, args []string) error {
 		return err
 	}
 	if len(execs) == 0 {
-		fmt.Println("no executions")
+		fmt.Fprintln(g.out, "no executions")
 		return nil
 	}
 	// Status is derived from item state, not read from a column: durableq has
 	// no completion barrier, so an execution row never announces that it
 	// finished. Printing the stored value here would be a stale answer.
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	w := tabwriter.NewWriter(g.out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "EXECUTION\tJOB\tSTATUS\tACTIVE\tDLQ\tSTARTED")
 	for _, e := range execs {
 		counts, err := st.StepCounts(ctx, e.ID)
@@ -402,8 +411,8 @@ func cmdRun(ctx context.Context, g globals, args []string) error {
 	}
 	p := execution.Project(exec, counts, edges)
 
-	fmt.Printf("Run %s (%s)\nStatus: %s\n\n", p.Execution.ID, p.Execution.Job, p.Status)
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(g.out, "Run %s (%s)\nStatus: %s\n\n", p.Execution.ID, p.Execution.Job, p.Status)
+	w := tabwriter.NewWriter(g.out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "STEP\tRECEIVED\tSUCCESS\tFILTERED\tDLQ\tACTIVE\tPRODUCED")
 	for _, s := range p.Steps {
 		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%d\n",
@@ -413,13 +422,13 @@ func cmdRun(ctx context.Context, g globals, args []string) error {
 		return err
 	}
 
-	fmt.Printf("\nTerminal successful: %d\nTerminal DLQ:        %d\nActive:              %d\n",
+	fmt.Fprintf(g.out, "\nTerminal successful: %d\nTerminal DLQ:        %d\nActive:              %d\n",
 		p.TerminalSuccess, p.TerminalDLQ, p.Active)
 
 	if p.HasLeaks() {
-		fmt.Println("\nUnaccounted for:")
+		fmt.Fprintln(g.out, "\nUnaccounted for:")
 		for _, l := range p.Leaks {
-			fmt.Printf("  %s\n", l)
+			fmt.Fprintf(g.out, "  %s\n", l)
 		}
 	}
 	return nil
@@ -442,7 +451,7 @@ func cmdTrace(ctx context.Context, g globals, args []string) error {
 	if len(entries) == 0 {
 		return fmt.Errorf("no execution %s", args[0])
 	}
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	w := tabwriter.NewWriter(g.out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "STEP\tRESULT\tATTEMPTS\tERROR")
 	for _, e := range entries {
 		if !e.Entered {
@@ -463,6 +472,10 @@ func cmdGC(ctx context.Context, g globals, args []string) error {
 	retention := fs.Duration("retention", 7*24*time.Hour, "how long completed items are kept")
 	queue := fs.String("queue", "", "limit to one queue")
 	batch := fs.Int("batch", 1000, "items deleted per statement")
+	fold := fs.Bool("fold", false, "fold deleted items into saved counts and history, as an App with Fold does")
+	historyRetention := fs.Duration("history-retention", 7*24*time.Hour, "with -fold, how long item history is kept")
+	labels := filterLabelsFlag{}
+	fs.Var(labels, "filter-label", "with -fold, job=flag[,flag]: payload flags counted among the job's filtered items (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -473,22 +486,47 @@ func cmdGC(ctx context.Context, g globals, args []string) error {
 	}
 	defer closeFn()
 
+	// One cutoff for the whole run, and each batch starts where the last one
+	// ended, as the App's sweeper does.
+	now := time.Now().UTC()
+	if *fold {
+		if err := st.PrepareFold(ctx, storage.FoldOpts{Now: now, HistoryRetention: *historyRetention}); err != nil {
+			return err
+		}
+	}
 	total := 0
+	var after time.Time
 	for {
-		n, err := st.Sweep(ctx, storage.SweepOpts{
-			Queue: *queue, Retention: *retention, Limit: *batch,
+		res, err := st.Sweep(ctx, storage.SweepOpts{
+			Queue: *queue, Retention: *retention, Limit: *batch, Now: now, After: after,
+			Fold: *fold, HistoryRetention: *historyRetention, FilterLabels: labels,
 		})
 		if err != nil {
 			return err
 		}
-		total += n
-		if n == 0 {
+		total += res.Deleted
+		if res.Deleted == 0 {
 			break
 		}
-		fmt.Printf("deleted %d (%d total)\n", n, total)
+		after = res.Last
+		fmt.Fprintf(g.out, "deleted %d (%d total)\n", res.Deleted, total)
 	}
-	fmt.Printf("deleted %d completed items older than %s\n", total, *retention)
-	fmt.Println("dead-lettered items are never swept")
+	fmt.Fprintf(g.out, "deleted %d completed items older than %s\n", total, *retention)
+	fmt.Fprintln(g.out, "dead-lettered items are never swept")
+	return nil
+}
+
+// filterLabelsFlag collects -filter-label job=flag[,flag] values.
+type filterLabelsFlag map[string][]string
+
+func (f filterLabelsFlag) String() string { return "" }
+
+func (f filterLabelsFlag) Set(v string) error {
+	job, flags, ok := strings.Cut(v, "=")
+	if !ok || job == "" || flags == "" {
+		return fmt.Errorf("want job=flag[,flag], got %q", v)
+	}
+	f[job] = append(f[job], strings.Split(flags, ",")...)
 	return nil
 }
 
@@ -506,13 +544,13 @@ func cmdPause(ctx context.Context, g globals, args []string, pause bool) error {
 		if err := st.PauseQueue(ctx, args[0]); err != nil {
 			return err
 		}
-		fmt.Printf("paused %s\n", args[0])
+		fmt.Fprintf(g.out, "paused %s\n", args[0])
 		return nil
 	}
 	if err := st.ResumeQueue(ctx, args[0]); err != nil {
 		return err
 	}
-	fmt.Printf("resumed %s\n", args[0])
+	fmt.Fprintf(g.out, "resumed %s\n", args[0])
 	return nil
 }
 
