@@ -137,9 +137,9 @@ func runSweep(t *testing.T, h Harness) {
 		clock.Advance(48 * time.Hour)
 		fresh := completeOne(t, store, "q")
 
-		n, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: 24 * time.Hour})
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: 24 * time.Hour})
 		requireNoErr(t, err, "Sweep")
-		requireEqual(t, n, 1, "only the item past retention is deleted")
+		requireEqual(t, res.Deleted, 1, "only the item past retention is deleted")
 
 		_, err = store.GetItem(t.Context(), old.ID)
 		requireErrIs(t, err, storage.ErrNotFound, "old item swept")
@@ -153,9 +153,9 @@ func runSweep(t *testing.T, h Harness) {
 		it := completeOne(t, store, "q")
 		clock.Advance(365 * 24 * time.Hour)
 
-		n, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: storage.RetentionNever})
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: storage.RetentionNever})
 		requireNoErr(t, err, "Sweep")
-		requireEqual(t, n, 0, "retention off means off")
+		requireEqual(t, res.Deleted, 0, "retention off means off")
 
 		_, err = store.GetItem(t.Context(), it.ID)
 		requireNoErr(t, err, "item kept for ever")
@@ -168,9 +168,9 @@ func runSweep(t *testing.T, h Harness) {
 
 		// A year past any plausible retention.
 		clock.Advance(365 * 24 * time.Hour)
-		n, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour})
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour})
 		requireNoErr(t, err, "Sweep")
-		requireEqual(t, n, 0, "the DLQ is the record of what went wrong; it is never swept on a timer")
+		requireEqual(t, res.Deleted, 0, "the DLQ is the record of what went wrong; it is never swept on a timer")
 
 		got, err := store.GetItem(t.Context(), dead.ID)
 		requireNoErr(t, err, "GetItem")
@@ -185,9 +185,9 @@ func runSweep(t *testing.T, h Harness) {
 		ready := mustEnqueue(t, store, storage.NewItem{Queue: "q"})[0]
 
 		clock.Advance(365 * 24 * time.Hour)
-		n, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Second})
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Second})
 		requireNoErr(t, err, "Sweep")
-		requireEqual(t, n, 0, "a sweep must never race a live lease")
+		requireEqual(t, res.Deleted, 0, "a sweep must never race a live lease")
 
 		_, err = store.GetItem(t.Context(), ready.ID)
 		requireNoErr(t, err, "ready item kept")
@@ -203,13 +203,13 @@ func runSweep(t *testing.T, h Harness) {
 		}
 		clock.Advance(48 * time.Hour)
 
-		n, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour, Limit: 2})
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour, Limit: 2})
 		requireNoErr(t, err, "Sweep")
-		requireEqual(t, n, 2, "batch limit respected")
+		requireEqual(t, res.Deleted, 2, "batch limit respected")
 
-		n, err = store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour, Limit: 100})
+		res, err = store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour, Limit: 100})
 		requireNoErr(t, err, "Sweep")
-		requireEqual(t, n, 3, "the rest on a second pass")
+		requireEqual(t, res.Deleted, 3, "the rest on a second pass")
 	})
 
 	t.Run("ScopedToOneQueue", func(t *testing.T) {
@@ -219,13 +219,83 @@ func runSweep(t *testing.T, h Harness) {
 		b := completeOne(t, store, "b")
 		clock.Advance(48 * time.Hour)
 
-		n, err := store.Sweep(t.Context(), storage.SweepOpts{Queue: "a", Retention: time.Hour})
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Queue: "a", Retention: time.Hour})
 		requireNoErr(t, err, "Sweep")
-		requireEqual(t, n, 1, "only queue a swept")
+		requireEqual(t, res.Deleted, 1, "only queue a swept")
 
 		_, err = store.GetItem(t.Context(), a.ID)
 		requireErrIs(t, err, storage.ErrNotFound, "queue a item swept")
 		_, err = store.GetItem(t.Context(), b.ID)
 		requireNoErr(t, err, "queue b item kept")
+	})
+
+	t.Run("OldestFirstAndReportsLast", func(t *testing.T) {
+		t.Parallel()
+		store, clock := h.New(t)
+		first := completeOne(t, store, "q")
+		clock.Advance(time.Minute)
+		second := completeOne(t, store, "q")
+		clock.Advance(time.Minute)
+		third := completeOne(t, store, "q")
+		clock.Advance(48 * time.Hour)
+
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour, Limit: 2})
+		requireNoErr(t, err, "Sweep")
+		requireEqual(t, res.Deleted, 2, "one batch")
+		requireTimeEqual(t, res.Last, second.FinalizedAt, "Last is the newest finalized_at deleted")
+		_, err = store.GetItem(t.Context(), first.ID)
+		requireErrIs(t, err, storage.ErrNotFound, "oldest swept first")
+		_, err = store.GetItem(t.Context(), third.ID)
+		requireNoErr(t, err, "newest left for the next batch")
+
+		res, err = store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour, Limit: 2})
+		requireNoErr(t, err, "Sweep")
+		requireEqual(t, res.Deleted, 1, "the rest")
+		requireTimeEqual(t, res.Last, third.FinalizedAt, "Last of the second batch")
+
+		res, err = store.Sweep(t.Context(), storage.SweepOpts{Retention: time.Hour})
+		requireNoErr(t, err, "Sweep")
+		requireEqual(t, res.Deleted, 0, "nothing left")
+		requireEqual(t, res.Last.IsZero(), true, "Last is zero when nothing was deleted")
+	})
+
+	t.Run("StartsAtAfterInclusive", func(t *testing.T) {
+		t.Parallel()
+		store, clock := h.New(t)
+		before := completeOne(t, store, "q")
+		clock.Advance(time.Minute)
+		// Two items finished at the same instant: a batch that ended on one
+		// must not make the next batch skip the other.
+		mustEnqueue(t, store, storage.NewItem{Queue: "q"}, storage.NewItem{Queue: "q"})
+		both := claim(t, store, "q", "w1", 2)
+		requireLen(t, both, 2, "claim")
+		_, err := store.Complete(t.Context(),
+			storage.CompleteRequest{ID: both[0].ID, Worker: "w1"},
+			storage.CompleteRequest{ID: both[1].ID, Worker: "w1"})
+		requireNoErr(t, err, "Complete")
+		tied, err := store.GetItem(t.Context(), both[0].ID)
+		requireNoErr(t, err, "GetItem")
+		clock.Advance(48 * time.Hour)
+
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{
+			Retention: time.Hour, After: tied.FinalizedAt,
+		})
+		requireNoErr(t, err, "Sweep")
+		requireEqual(t, res.Deleted, 2, "both items at After swept")
+		_, err = store.GetItem(t.Context(), before.ID)
+		requireNoErr(t, err, "an item finished before After is left alone")
+	})
+
+	t.Run("RetentionZeroSweepsEverythingFinished", func(t *testing.T) {
+		t.Parallel()
+		store, clock := h.New(t)
+		it := completeOne(t, store, "q")
+		clock.Advance(time.Second)
+
+		res, err := store.Sweep(t.Context(), storage.SweepOpts{Retention: storage.RetentionZero})
+		requireNoErr(t, err, "Sweep")
+		requireEqual(t, res.Deleted, 1, "a finished item is due at once")
+		_, err = store.GetItem(t.Context(), it.ID)
+		requireErrIs(t, err, storage.ErrNotFound, "swept")
 	})
 }

@@ -26,11 +26,11 @@ func (s *stressStore) ReclaimExpired(context.Context, storage.ReclaimOpts) (stor
 	return storage.ReclaimResult{}, nil
 }
 
-func (s *stressStore) Sweep(context.Context, storage.SweepOpts) (int, error) {
+func (s *stressStore) Sweep(context.Context, storage.SweepOpts) (storage.SweepResult, error) {
 	s.mu.Lock()
 	s.calls++
 	s.mu.Unlock()
-	return 0, nil
+	return storage.SweepResult{}, nil
 }
 
 // TestReclaimerStartStopStress catches shutdown races: a maintenance loop
@@ -93,7 +93,7 @@ func TestSweeperStartStopStress(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				s.Pass(ctx)
+				_, _ = s.Pass(ctx)
 			}()
 		}
 		wg.Add(1)

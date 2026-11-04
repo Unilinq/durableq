@@ -38,6 +38,7 @@ type Sink interface {
 	LeasesExpired(reclaimed, deadLettered int)
 	QueueDepth(queue string, ready, running, dlq int)
 	ItemsSwept(deleted int)
+	SweepBacklog(backlog time.Duration)
 }
 
 // Nop discards every event.
@@ -53,6 +54,7 @@ func (Nop) LeasesRenewed(string, int)                           {}
 func (Nop) LeasesExpired(int, int)                              {}
 func (Nop) QueueDepth(string, int, int, int)                    {}
 func (Nop) ItemsSwept(int)                                      {}
+func (Nop) SweepBacklog(time.Duration)                          {}
 
 // SamplerConfig parameterises a queue-depth sampler.
 type SamplerConfig struct {

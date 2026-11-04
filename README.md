@@ -282,6 +282,7 @@ durableq dlq replay indexing.dlq -error-contains unsupported_pdf
 durableq pause indexing                      # stop claiming; in-flight work finishes
 durableq resume indexing
 durableq gc -retention 168h                  # delete completed items; the DLQ is never swept
+durableq gc -retention 0 -fold -filter-label crawl=gone,excluded  # the same, keeping their counts
 ```
 
 Every working queue has a dead-letter queue named after it (`indexing.dlq`). The
@@ -297,13 +298,53 @@ the item, which is what makes `-error-contains` replay useful after a fix.
 | `HeartbeatInterval` | `LeaseDuration/3` | Tolerates two missed beats before an item is reclaimable. |
 | `HandlerTimeout` | 5m | A handler that overruns frees its worker slot and the item is retried. |
 | `DrainTimeout` | 30s | How long `Stop` waits before handing work back. |
-| `Retention` | 7 days | How long completed items are kept. `storage.RetentionNever` keeps them for ever. Dead-lettered items are never swept. |
+| `Retention` | 7 days | How long completed items are kept. `storage.RetentionNever` keeps them for ever; `storage.RetentionZero` sweeps them on the next pass. Dead-lettered items are never swept. |
+| `SweepBatch` | 1000 | Most items one sweep statement deletes. |
+| `SweepBudget` | 0 | How long one sweep pass keeps deleting full batches. Zero is one batch per `SweepInterval`; set it when more items finish per minute than one batch holds. |
+| `Fold` | off | Keep counts, item history and lineage when completed items are swept. See below. |
+| `HistoryRetention` | 7 days | With `Fold`, how long a swept item stays readable by `durableq item` and `trace`. |
 | `FlushSize` | 500 | Items a streaming step buffers before it commits them. `StepFlush` sets it per step. |
 | `FlushInterval` | 1s | Longest a streaming step holds buffered items; checked inside `Add`. |
 | `DefaultPolicy` | 5 attempts, 5s / 30s / 2m / 10m, 10% jitter | Per queue with `WithPolicy`, per step with `StepPolicy`. |
 
 The policy is snapshotted onto an item when it is enqueued, so changing a
 queue's policy never rewrites work already in flight.
+
+## Sweeping without losing counts
+
+Projections, `Stats` and lineage are queries over the items table, so sweeping
+a completed item normally removes it from them too, and `Retention` is also how
+far back a run's numbers reach. With `Fold`, the statement that deletes a batch
+of completed items also adds them to saved per-step counts, a per-hour done
+tally and a per-day item history, and every reader adds those to the rows still
+in the table in one statement. Nothing anyone reads changes when an item is
+swept, a batch cut off part-way rolls back whole, and retention can drop to
+`storage.RetentionZero`, which keeps the items table to the work in flight and
+the dead letters:
+
+```go
+app, _ := durableq.New(durableq.Config{
+    Store:       store,
+    Fold:        true,
+    Retention:   storage.RetentionZero,
+    SweepBatch:  10_000,
+    SweepBudget: 30 * time.Second,
+})
+app.Job("crawl", durableq.FilterLabels("gone", "excluded")) // see below
+```
+
+- `Stats` keeps reporting swept items as done for `postgres.Config.DoneWindow`
+  (7 days) after they finished, as a seven-day sweep without folding would.
+- `durableq item` and `trace` read a swept item from its history for
+  `HistoryRetention`. The history keeps no payload, policy or `available_at`.
+- `FilterLabels` names boolean payload fields that say why an item was
+  filtered. A filtered item with one of them true is also counted under that
+  label (`postgres.Store.FilteredByLabel`). The payload is read when the item
+  is swept, so items that finished before the option was set count too.
+- The readers read the saved tables whether or not anything folds, so apply
+  migration 3 before deploying a version that has them.
+- `durableq gc -fold` folds the same way. A `gc` without `-fold` on an
+  installation that folds loses the counts of what it deletes.
 
 ## Shutdown
 

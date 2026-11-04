@@ -68,13 +68,28 @@ type Config struct {
 	ReclaimBatch int
 
 	// Retention is how long a completed item is kept before it is swept.
-	// storage.RetentionNever keeps completed items for ever. Dead-lettered
-	// items are never swept whatever this says.
+	// storage.RetentionNever keeps completed items for ever;
+	// storage.RetentionZero sweeps them on the next pass. Dead-lettered items
+	// are never swept whatever this says.
 	Retention time.Duration
 	// SweepInterval is how often retention is applied.
 	SweepInterval time.Duration
-	// SweepBatch bounds one sweep pass.
+	// SweepBatch bounds one sweep batch.
 	SweepBatch int
+	// SweepBudget is how long one sweep pass may keep deleting full batches,
+	// so a store that finishes more than SweepBatch items per SweepInterval
+	// still catches up. Zero deletes one batch per pass.
+	SweepBudget time.Duration
+
+	// Fold makes the sweeper fold every completed item it deletes into saved
+	// per-step counts, a per-hour done tally and the item's history, in the
+	// statement that deletes it. Projections, Stats, items, attempts and
+	// lineage then read the same after a sweep as before it, so Retention
+	// can be RetentionZero. The store must implement storage.Folder.
+	Fold bool
+	// HistoryRetention is how long a folded item's history (what GetItem,
+	// Attempts and Lineage read once its row is gone) is kept. Default 7 days.
+	HistoryRetention time.Duration
 
 	// DefaultPolicy applies to queues that do not set their own.
 	DefaultPolicy storage.Policy
@@ -131,6 +146,9 @@ func (c *Config) withDefaults() {
 	}
 	if c.SweepBatch <= 0 {
 		c.SweepBatch = 1000
+	}
+	if c.HistoryRetention <= 0 {
+		c.HistoryRetention = 7 * 24 * time.Hour
 	}
 	if c.DefaultPolicy.MaxAttempts == 0 && len(c.DefaultPolicy.Schedule) == 0 {
 		c.DefaultPolicy = storage.DefaultPolicy()
@@ -337,16 +355,37 @@ func (a *App) lazyReclaimer() *scheduler.Reclaimer {
 func (a *App) lazySweeper() *scheduler.Sweeper {
 	if a.sweeper == nil {
 		a.sweeper = scheduler.NewSweeper(scheduler.SweeperConfig{
-			Store:     a.cfg.Store,
-			Interval:  a.cfg.SweepInterval,
-			Retention: a.cfg.Retention,
-			BatchSize: a.cfg.SweepBatch,
-			Clock:     a.cfg.Clock,
-			Logger:    a.cfg.Logger,
-			Metrics:   a.metrics,
+			Store:            a.cfg.Store,
+			Interval:         a.cfg.SweepInterval,
+			Retention:        a.cfg.Retention,
+			BatchSize:        a.cfg.SweepBatch,
+			Budget:           a.cfg.SweepBudget,
+			Fold:             a.cfg.Fold,
+			HistoryRetention: a.cfg.HistoryRetention,
+			FilterLabels:     a.filterLabels,
+			Clock:            a.cfg.Clock,
+			Logger:           a.cfg.Logger,
+			Metrics:          a.metrics,
 		})
 	}
 	return a.sweeper
+}
+
+// filterLabels gathers the FilterLabels of every job, for the sweeper to fold.
+func (a *App) filterLabels() map[string][]string {
+	a.mu.Lock()
+	jobs := make([]*Job, 0, len(a.jobs))
+	for _, j := range a.jobs {
+		jobs = append(jobs, j)
+	}
+	a.mu.Unlock()
+	out := map[string][]string{}
+	for _, j := range jobs {
+		if labels := j.labels(); len(labels) > 0 {
+			out[j.name] = labels
+		}
+	}
+	return out
 }
 
 // poolConfig builds the runtime configuration shared by every worker.

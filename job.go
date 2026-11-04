@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -31,11 +32,39 @@ type Job struct {
 	app  *App
 	name string
 
-	mu         sync.Mutex
-	steps      []*Step
-	wired      bool
-	buildErr   error
-	successors map[string][]string
+	mu           sync.Mutex
+	steps        []*Step
+	wired        bool
+	buildErr     error
+	successors   map[string][]string
+	filterLabels []string
+}
+
+// JobOption configures a job.
+type JobOption func(*Job)
+
+// FilterLabels names boolean payload fields that say why a step filtered an
+// item, such as "gone" or "excluded". When Config.Fold sweeps a filtered item
+// of this job whose payload has one of them set to true, the item is counted
+// under that label in the saved counts as well as under filtered, so a reader
+// that splits filtered items by payload flag keeps its numbers once the item
+// is gone. Labels are read from the payload at fold time, so they also count
+// items that finished before the option was set.
+func FilterLabels(flags ...string) JobOption {
+	return func(j *Job) {
+		for _, f := range flags {
+			if f != "" && !slices.Contains(j.filterLabels, f) {
+				j.filterLabels = append(j.filterLabels, f)
+			}
+		}
+	}
+}
+
+// labels returns the job's FilterLabels.
+func (j *Job) labels() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return slices.Clone(j.filterLabels)
 }
 
 // Step is one stage of a job.
@@ -94,15 +123,21 @@ func After(steps ...string) StepOption {
 	}
 }
 
-// Job returns the named job, creating it on first use.
-func (a *App) Job(name string) *Job {
+// Job returns the named job, creating it on first use. Options apply to the
+// job whether or not it already existed.
+func (a *App) Job(name string, opts ...JobOption) *Job {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if j, ok := a.jobs[name]; ok {
-		return j
+	j, ok := a.jobs[name]
+	if !ok {
+		j = &Job{app: a, name: name}
+		a.jobs[name] = j
 	}
-	j := &Job{app: a, name: name}
-	a.jobs[name] = j
+	a.mu.Unlock()
+	j.mu.Lock()
+	for _, opt := range opts {
+		opt(j)
+	}
+	j.mu.Unlock()
 	return j
 }
 
